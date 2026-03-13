@@ -13,8 +13,8 @@ fn postJson(
     const stringified = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(stringified);
 
-    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth);
+    var auth_buf: [256]u8 = undefined; // fixed length buffer, no alloc
+    const auth = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key});
 
     var writer: std.io.Writer.Allocating = .init(allocator);
 
