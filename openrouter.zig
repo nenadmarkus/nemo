@@ -2,11 +2,13 @@ const std = @import("std");
 
 fn InvokeIntelligence(
     allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    model: []const u8,
     api_key: []const u8,
     messages: anytype,
 ) ![]u8 {
     const request = .{
-        .model = "nvidia/nemotron-3-super-120b-a12b:free",
+        .model = model,
         .messages = messages,
         .reasoning = .{ .enabled = false },
     };
@@ -25,7 +27,7 @@ fn InvokeIntelligence(
     defer aw.deinit();
 
     const result = try client.fetch(.{
-        .location = .{ .url = "https://openrouter.ai/api/v1/chat/completions" },
+        .location = .{ .url = endpoint },
         .method = .POST,
         .headers = .{
             .content_type = .{ .override = "application/json" },
@@ -77,7 +79,7 @@ pub fn main() !void {
         .{ .role = "user", .content = "How many r's are in the word strawberry?" },
     };
 
-    const response = try InvokeIntelligence(allocator, api_key, messages);
+    const response = try InvokeIntelligence(allocator, "https://openrouter.ai/api/v1/chat/completions", "nvidia/nemotron-3-super-120b-a12b:free", api_key, messages);
     defer allocator.free(response);
 
     std.debug.print("{s}\n", .{response});
