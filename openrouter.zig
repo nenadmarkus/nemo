@@ -18,8 +18,7 @@ fn postJson(
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    var aw: std.io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
+    var writer: std.io.Writer.Allocating = .init(allocator);
 
     const result = try client.fetch(.{
         .location = .{ .url = url },
@@ -29,10 +28,10 @@ fn postJson(
             .authorization = .{ .override = auth },
         },
         .payload = stringified,
-        .response_writer = &aw.writer,
+        .response_writer = &writer.writer,
     });
 
-    const body = try allocator.dupe(u8, aw.written());
+    const body = try writer.toOwnedSlice();
 
     return .{
         .status = result.status,
