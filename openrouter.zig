@@ -1,6 +1,46 @@
 const std = @import("std");
 
-fn InvokeIntelligence(
+fn postJson(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    api_key: []const u8,
+    payload: anytype,
+) !struct {
+    status: std.http.Status,
+    body: []u8,
+} {
+    const stringified = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(stringified);
+
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    defer allocator.free(auth);
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var aw: std.io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .authorization = .{ .override = auth },
+        },
+        .payload = stringified,
+        .response_writer = &aw.writer,
+    });
+
+    const body = try allocator.dupe(u8, aw.written());
+
+    return .{
+        .status = result.status,
+        .body = body,
+    };
+}
+
+fn invokeIntelligence(
     allocator: std.mem.Allocator,
     endpoint: []const u8,
     model: []const u8,
@@ -13,38 +53,16 @@ fn InvokeIntelligence(
         .reasoning = .{ .enabled = false },
     };
 
-    // Build JSON body using Stringify.valueAlloc
-    const body = try std.json.Stringify.valueAlloc(allocator, request, .{});
-    defer allocator.free(body);
+    const resp = try postJson(allocator, endpoint, api_key, request);
+    defer allocator.free(resp.body);
 
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_header);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var aw: std.io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = endpoint },
-        .method = .POST,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = auth_header },
-        },
-        .payload = body,
-        .response_writer = &aw.writer,
-    });
-
-    const response_bytes = aw.written();
-
-    if (result.status != .ok) {
-        return std.fmt.allocPrint(allocator, "HTTP Error: {}\n{s}", .{ result.status, response_bytes });
+    if (resp.status != .ok) {
+        std.debug.print("HTTP {}: {s}\n", .{ resp.status, resp.body });
+        return error.HttpError;
     }
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{}) catch {
-        return try allocator.dupe(u8, response_bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch {
+        return try allocator.dupe(u8, resp.body);
     };
     defer parsed.deinit();
 
@@ -61,7 +79,7 @@ fn InvokeIntelligence(
         }
     }
 
-    return try allocator.dupe(u8, response_bytes);
+    return try allocator.dupe(u8, resp.body);
 }
 
 pub fn main() !void {
@@ -79,7 +97,7 @@ pub fn main() !void {
         .{ .role = "user", .content = "How many r's are in the word strawberry?" },
     };
 
-    const response = try InvokeIntelligence(allocator, "https://openrouter.ai/api/v1/chat/completions", "nvidia/nemotron-3-super-120b-a12b:free", api_key, messages);
+    const response = try invokeIntelligence(allocator, "https://openrouter.ai/api/v1/chat/completions", "nvidia/nemotron-3-super-120b-a12b:free", api_key, messages);
     defer allocator.free(response);
 
     std.debug.print("{s}\n", .{response});
