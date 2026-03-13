@@ -2,6 +2,7 @@ const std = @import("std");
 
 fn postJson(
     allocator: std.mem.Allocator,
+    client: *std.http.Client,
     url: []const u8,
     api_key: []const u8,
     payload: anytype,
@@ -14,9 +15,6 @@ fn postJson(
 
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
 
     var writer: std.io.Writer.Allocating = .init(allocator);
 
@@ -52,7 +50,10 @@ fn invokeIntelligence(
         .reasoning = .{ .enabled = false },
     };
 
-    const resp = try postJson(allocator, endpoint, api_key, request);
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const resp = try postJson(allocator, &client, endpoint, api_key, request);
     defer allocator.free(resp.body);
 
     if (resp.status != .ok) {
