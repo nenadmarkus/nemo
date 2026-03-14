@@ -166,7 +166,7 @@ func buildToolSpecs() []map[string]interface{} {
 	return tools
 }
 
-func InvokeIntelligence(username, message, url, apiKey string) (string, error) {
+func InvokeIntelligence(username, message, url, model, apiKey string) (string, error) {
 
 	client := &http.Client{Timeout: 32 * time.Second}
 
@@ -192,7 +192,7 @@ func InvokeIntelligence(username, message, url, apiKey string) (string, error) {
 	for i := 0; i < maxIterations; i++ {
 		// construct the request
 		reqBody := map[string]interface{}{
-			"model":       "openrouter/hunter-alpha",
+			"model":       model,
 			"messages":    messages,
 			"tools":       tools,
 			"tool_choice": "auto",
@@ -288,8 +288,10 @@ func main() {
 		return
 	}
 
-	//out, err := InvokeIntelligence("alice", "How many r's are in strawberry?", url, apiKey)
-	out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, apiKey)
+	model:= "openrouter/hunter-alpha"
+
+	//out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, model, apiKey)
+	out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
 	if err != nil {
 		fmt.Println("error:", err)
 		return
