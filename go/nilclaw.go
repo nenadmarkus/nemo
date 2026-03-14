@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+
+	"github.com/go-shiori/go-readability"
 )
 
 const maxIterations = 32
@@ -75,17 +77,15 @@ var toolRegistry = map[string]Tool{
 	},
 	"fetch": {
 		Name: "fetch",
-		Description: "make an HTTP request to a URL and return the response body",
+		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"url": map[string]interface{}{
 					"type": "string",
-					"description": "target URL",
 				},
 				"method": map[string]interface{}{
 					"type": "string",
-					"description": "HTTP method (GET, POST, PUT, PATCH, DELETE)",
 					"default": "GET",
 				},
 				"headers": map[string]interface{}{
@@ -93,16 +93,23 @@ var toolRegistry = map[string]Tool{
 					"additionalProperties": map[string]interface{}{
 						"type": "string",
 					},
-					"description": "optional HTTP headers",
 				},
 				"body": map[string]interface{}{
 					"type": "string",
-					"description": "optional request body",
+				},
+				"max_bytes": map[string]interface{}{
+					"type": "integer",
+					"description": "maximum response size in bytes (default 2097152)",
+				},
+				"readable": map[string]interface{}{
+					"type": "boolean",
+					"description": "postprocess to extract main readable content",
 				},
 			},
 			"required": []string{"url"},
 		},
 		Handler: func(args map[string]interface{}) (string, error) {
+
 			urlStr, ok := args["url"].(string)
 			if !ok || urlStr == "" {
 				return "", fmt.Errorf("url is required")
@@ -123,7 +130,8 @@ var toolRegistry = map[string]Tool{
 				return "", err
 			}
 
-			// headers
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+
 			if h, ok := args["headers"].(map[string]interface{}); ok {
 				for k, v := range h {
 					if vs, ok := v.(string); ok {
@@ -132,19 +140,58 @@ var toolRegistry = map[string]Tool{
 				}
 			}
 
-			client := &http.Client{ Timeout: 16 * time.Second }
+			client := &http.Client{Timeout: 15 * time.Second}
+
 			res, err := client.Do(req)
 			if err != nil {
 				return "", err
 			}
 			defer res.Body.Close()
 
-			respBody, err := io.ReadAll(res.Body)
+			maxBytes := int64(2 * 1024 * 1024)
+			if mb, ok := args["max_bytes"].(float64); ok && mb > 0 {
+				maxBytes = int64(mb)
+			}
+
+			data, err := io.ReadAll(io.LimitReader(res.Body, maxBytes))
 			if err != nil {
 				return "", err
 			}
 
-			return string(respBody), nil
+			readable := false
+			if r, ok := args["readable"].(bool); ok {
+				readable = r
+			}
+
+			if readable {
+
+				u, err := url.Parse(urlStr)
+				if err != nil {
+					return "", err
+				}
+				article, err := readability.FromReader(
+					bytes.NewReader(data),
+					u,
+				)
+				if err != nil {
+					return "", err
+				}
+
+				out := struct {
+					Title string `json:"title"`
+					Text  string `json:"text"`
+					URL   string `json:"url"`
+				}{
+					Title: article.Title,
+					Text:  article.TextContent,
+					URL:   urlStr,
+				}
+
+				b, _ := json.Marshal(out)
+				return string(b), nil
+			}
+
+			return string(data), nil
 		},
 	},
 }
