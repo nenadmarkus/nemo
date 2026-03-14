@@ -132,7 +132,7 @@ var toolRegistry = map[string]Tool{
 				}
 			}
 
-			client := &http.Client{}
+			client := &http.Client{ Timeout: 16 * time.Second }
 			res, err := client.Do(req)
 			if err != nil {
 				return "", err
