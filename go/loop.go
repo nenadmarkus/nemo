@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"time"
+	"strings"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 )
 
@@ -22,27 +24,127 @@ type Tool struct {
 }
 
 var toolRegistry = map[string]Tool{
-	"count_r": {
-		Name:        "count_r",
-		Description: "count r characters in a word",
+	"search": {
+		Name: "search",
+		Description: "find web pages on the world wide web (url + short description)",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"word": map[string]interface{}{
+				"query": map[string]interface{}{
 					"type": "string",
 				},
 			},
-			"required": []string{"word"},
+			"required": []string{"query"},
 		},
 		Handler: func(args map[string]interface{}) (string, error) {
-			word := args["word"].(string)
-			count := 0
-			for _, c := range word {
-				if c == 'r' || c == 'R' {
-					count++
+			// get access
+			apiKey := os.Getenv("SERPER_API_KEY")
+			if apiKey == "" {
+				return "", fmt.Errorf("no search API key")
+			}
+
+			// do the query
+			query, ok := args["query"].(string)
+			if !ok || query == "" {
+				return "", fmt.Errorf("query is required")
+			}
+
+			fullUrl := fmt.Sprintf("https://google.serper.dev/search?q=%s&apiKey=%s", url.QueryEscape(query), apiKey)
+			method := "GET"
+
+			client := &http.Client {}
+			req, err := http.NewRequest(method, fullUrl, nil)
+			if err != nil {
+				return "", err
+			}
+
+			res, err := client.Do(req)
+			if err != nil {
+				return "", err
+			}
+			defer res.Body.Close()
+
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				return "", err
+			}
+
+			// we're done
+			return string(body), nil
+		},
+	},
+	"fetch": {
+		Name: "fetch",
+		Description: "make an HTTP request to a URL and return the response body",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"url": map[string]interface{}{
+					"type": "string",
+					"description": "target URL",
+				},
+				"method": map[string]interface{}{
+					"type": "string",
+					"description": "HTTP method (GET, POST, PUT, PATCH, DELETE)",
+					"default": "GET",
+				},
+				"headers": map[string]interface{}{
+					"type": "object",
+					"additionalProperties": map[string]interface{}{
+						"type": "string",
+					},
+					"description": "optional HTTP headers",
+				},
+				"body": map[string]interface{}{
+					"type": "string",
+					"description": "optional request body",
+				},
+			},
+			"required": []string{"url"},
+		},
+		Handler: func(args map[string]interface{}) (string, error) {
+			urlStr, ok := args["url"].(string)
+			if !ok || urlStr == "" {
+				return "", fmt.Errorf("url is required")
+			}
+
+			method := "GET"
+			if m, ok := args["method"].(string); ok && m != "" {
+				method = strings.ToUpper(m)
+			}
+
+			var body io.Reader
+			if b, ok := args["body"].(string); ok && b != "" {
+				body = strings.NewReader(b)
+			}
+
+			req, err := http.NewRequest(method, urlStr, body)
+			if err != nil {
+				return "", err
+			}
+
+			// headers
+			if h, ok := args["headers"].(map[string]interface{}); ok {
+				for k, v := range h {
+					if vs, ok := v.(string); ok {
+						req.Header.Set(k, vs)
+					}
 				}
 			}
-			return fmt.Sprintf("%d", count), nil
+
+			client := &http.Client{}
+			res, err := client.Do(req)
+			if err != nil {
+				return "", err
+			}
+			defer res.Body.Close()
+
+			respBody, err := io.ReadAll(res.Body)
+			if err != nil {
+				return "", err
+			}
+
+			return string(respBody), nil
 		},
 	},
 }
@@ -66,7 +168,7 @@ func buildToolSpecs() []map[string]interface{} {
 
 func InvokeIntelligence(username, message, url, apiKey string) (string, error) {
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 32 * time.Second}
 
 	var messages []map[string]interface{}
 
@@ -90,7 +192,7 @@ func InvokeIntelligence(username, message, url, apiKey string) (string, error) {
 	for i := 0; i < maxIterations; i++ {
 		// construct the request
 		reqBody := map[string]interface{}{
-			"model":       "nvidia/nemotron-3-super-120b-a12b:free",
+			"model":       "openrouter/hunter-alpha",
 			"messages":    messages,
 			"tools":       tools,
 			"tool_choice": "auto",
@@ -99,20 +201,21 @@ func InvokeIntelligence(username, message, url, apiKey string) (string, error) {
 		j, _ := json.Marshal(reqBody)
 
 		// do the request
-		req, _ := http.NewRequest(
+		req, err := http.NewRequest(
 			"POST",
 			url,
 			bytes.NewBuffer(j),
 		)
+		if err != nil { return "", err }
 
 		req.Header.Set("Authorization", "Bearer " + apiKey)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := client.Do(req)
 		if err != nil { return "", err }
-		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close() // close immediately after reading, saves memory
 		if err != nil { return "", err }
 
 		// parse request body (JSON)
@@ -185,7 +288,8 @@ func main() {
 		return
 	}
 
-	out, err := InvokeIntelligence("alice", "How many r's are in strawberry?", url, apiKey)
+	//out, err := InvokeIntelligence("alice", "How many r's are in strawberry?", url, apiKey)
+	out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, apiKey)
 	if err != nil {
 		fmt.Println("error:", err)
 		return
