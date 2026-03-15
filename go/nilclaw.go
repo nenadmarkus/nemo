@@ -194,6 +194,46 @@ var toolRegistry = map[string]Tool{
 			return string(data), nil
 		},
 	},
+	"current_time": {
+		Name: "current_time",
+		Description: "returns the current time in a specified format and/or timezone",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"format": map[string]interface{}{
+					"type": "string",
+					"description": "Go time format string with extra format `unix` which returns a numeric Unix timestamp, default RFC3339",
+				},
+				"timezone": map[string]interface{}{
+					"type": "string",
+					"description": "IANA timezone name, e.g., 'America/New_York', default UTC",
+				},
+			},
+		},
+		Handler: func(args map[string]interface{}) (string, error) {
+			format := time.RFC3339
+			if f, ok := args["format"].(string); ok && f != "" {
+				format = f
+			}
+
+			loc := time.UTC
+			if tz, ok := args["timezone"].(string); ok && tz != "" {
+				if l, err := time.LoadLocation(tz); err == nil {
+					loc = l
+				} else {
+					return "", fmt.Errorf("invalid timezone: %s", tz)
+				}
+			}
+
+			now := time.Now().In(loc)
+
+			if format == "unix" {
+				return fmt.Sprintf("%d", now.Unix()), nil
+			}
+
+			return now.Format(format), nil
+		},
+	},
 }
 
 func buildToolSpecs() []map[string]interface{} {
@@ -338,7 +378,8 @@ func main() {
 	model:= "openrouter/hunter-alpha"
 
 	//out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, model, apiKey)
-	out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
+	//out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
+	out, err := InvokeIntelligence("alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
 		fmt.Println("error:", err)
 		return
