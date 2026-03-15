@@ -9,20 +9,51 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"os"
-
-	"github.com/go-shiori/go-readability"
 )
 
 const maxIterations = 32
 
-type ToolFunc func(map[string]interface{}) (string, error)
+// stolen from the picoclaw repo
+var (
+	// Pre-compiled regexes for HTML text extraction
+	reScript     = regexp.MustCompile(`<script[\s\S]*?</script>`)
+	reStyle      = regexp.MustCompile(`<style[\s\S]*?</style>`)
+	reTags       = regexp.MustCompile(`<[^>]+>`)
+	reWhitespace = regexp.MustCompile(`[^\S\n]+`)
+	reBlankLines = regexp.MustCompile(`\n{3,}`)
+	// DuckDuckGo result extraction
+	reDDGLink    = regexp.MustCompile(`<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>`)
+	reDDGSnippet = regexp.MustCompile(`<a class="result__snippet[^"]*".*?>([\s\S]*?)</a>`)
+)
+func extractText(htmlContent string) string {
+	result := reScript.ReplaceAllLiteralString(htmlContent, "")
+	result = reStyle.ReplaceAllLiteralString(result, "")
+	result = reTags.ReplaceAllLiteralString(result, "")
+
+	result = strings.TrimSpace(result)
+
+	result = reWhitespace.ReplaceAllString(result, " ")
+	result = reBlankLines.ReplaceAllString(result, "\n\n")
+
+	lines := strings.Split(result, "\n")
+	var cleanLines []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			cleanLines = append(cleanLines, line)
+		}
+	}
+
+	return strings.Join(cleanLines, "\n")
+}
 
 type Tool struct {
 	Name        string
 	Description string
 	Parameters  map[string]interface{}
-	Handler     ToolFunc
+	Handler     func(map[string]interface{}) (string, error)
 }
 
 var toolRegistry = map[string]Tool{
@@ -103,7 +134,7 @@ var toolRegistry = map[string]Tool{
 				},
 				"readable": map[string]interface{}{
 					"type": "boolean",
-					"description": "postprocess to extract main readable content",
+					"description": "light postprocessing to extract readable content by removing script and style tags, etc.",
 				},
 			},
 			"required": []string{"url"},
@@ -130,7 +161,7 @@ var toolRegistry = map[string]Tool{
 				return "", err
 			}
 
-			req.Header.Set("User-Agent", "Mozilla/5.0")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 			if h, ok := args["headers"].(map[string]interface{}); ok {
 				for k, v := range h {
@@ -164,31 +195,7 @@ var toolRegistry = map[string]Tool{
 			}
 
 			if readable {
-
-				u, err := url.Parse(urlStr)
-				if err != nil {
-					return "", err
-				}
-				article, err := readability.FromReader(
-					bytes.NewReader(data),
-					u,
-				)
-				if err != nil {
-					return "", err
-				}
-
-				out := struct {
-					Title string `json:"title"`
-					Text  string `json:"text"`
-					URL   string `json:"url"`
-				}{
-					Title: article.Title,
-					Text:  article.TextContent,
-					URL:   urlStr,
-				}
-
-				b, _ := json.Marshal(out)
-				return string(b), nil
+				return extractText(string(data)), nil
 			}
 
 			return string(data), nil
@@ -378,8 +385,8 @@ func main() {
 	model:= "openrouter/hunter-alpha"
 
 	//out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, model, apiKey)
-	//out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
-	out, err := InvokeIntelligence("alice", "What time is it in Croatia?", url, model, apiKey)
+	out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
+	//out, err := InvokeIntelligence("alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
 		fmt.Println("error:", err)
 		return
