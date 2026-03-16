@@ -13,9 +13,9 @@ import (
 	"os"
 )
 
-const maxIterations = 32
-
-// stolen from the picoclaw repo
+/*
+	stolen from the picoclaw repo
+*/
 var (
 	// Pre-compiled regexes for HTML text extraction
 	reScript     = regexp.MustCompile(`<script[\s\S]*?</script>`)
@@ -48,6 +48,10 @@ func extractText(htmlContent string) string {
 
 	return strings.Join(cleanLines, "\n")
 }
+
+/*
+	tool defs
+*/
 
 type Tool struct {
 	Name        string
@@ -283,7 +287,8 @@ func InvokeIntelligence(username, message, url, model, apiKey string) (string, e
 
 	tools := buildToolSpecs()
 
-	for i := 0; i < maxIterations; i++ {
+	const maxToolIterations = 32
+	for i := 0; i < maxToolIterations; i++ {
 		// construct the request
 		reqBody := map[string]interface{}{
 			"model":       model,
