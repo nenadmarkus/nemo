@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"os"
 )
@@ -61,55 +60,6 @@ type Tool struct {
 }
 
 var toolRegistry = map[string]Tool{
-	"search": {
-		Name: "search",
-		Description: "find web pages on the world wide web (url + short description)",
-		Parameters: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"query": map[string]interface{}{
-					"type": "string",
-				},
-			},
-			"required": []string{"query"},
-		},
-		Handler: func(args map[string]interface{}) (string, error) {
-			// get access
-			apiKey := os.Getenv("SERPER_API_KEY")
-			if apiKey == "" {
-				return "", fmt.Errorf("no search API key")
-			}
-
-			// do the query
-			query, ok := args["query"].(string)
-			if !ok || query == "" {
-				return "", fmt.Errorf("query is required")
-			}
-
-			fullUrl := fmt.Sprintf("https://google.serper.dev/search?q=%s&apiKey=%s", url.QueryEscape(query), apiKey)
-			method := "GET"
-
-			client := &http.Client {}
-			req, err := http.NewRequest(method, fullUrl, nil)
-			if err != nil {
-				return "", err
-			}
-
-			res, err := client.Do(req)
-			if err != nil {
-				return "", err
-			}
-			defer res.Body.Close()
-
-			body, err := io.ReadAll(res.Body)
-			if err != nil {
-				return "", err
-			}
-
-			// we're done
-			return string(body), nil
-		},
-	},
 	"fetch": {
 		Name: "fetch",
 		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
@@ -175,6 +125,22 @@ var toolRegistry = map[string]Tool{
 				}
 			}
 
+			// Apply token injection
+			hvPattern := []struct {
+				regex  *regexp.Regexp
+				name string
+				value  string
+			}{
+				{regexp.MustCompile(`^https://google\.serper\.dev/search\?q=`), "X-API-KEY", os.Getenv("SERPER_API_KEY")},
+			}
+			for _, pattern := range hvPattern {
+				if pattern.regex.MatchString(urlStr) {
+					fmt.Println("insert token")
+					req.Header.Set(pattern.name, pattern.value)
+					break
+				}
+			}
+
 			client := &http.Client{Timeout: 15 * time.Second}
 
 			res, err := client.Do(req)
@@ -203,46 +169,6 @@ var toolRegistry = map[string]Tool{
 			}
 
 			return string(data), nil
-		},
-	},
-	"current_time": {
-		Name: "current_time",
-		Description: "returns the current time in a specified format and/or timezone",
-		Parameters: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"format": map[string]interface{}{
-					"type": "string",
-					"description": "Go time format string with extra format `unix` which returns a numeric Unix timestamp, default RFC3339",
-				},
-				"timezone": map[string]interface{}{
-					"type": "string",
-					"description": "IANA timezone name, e.g., 'America/New_York', default UTC",
-				},
-			},
-		},
-		Handler: func(args map[string]interface{}) (string, error) {
-			format := time.RFC3339
-			if f, ok := args["format"].(string); ok && f != "" {
-				format = f
-			}
-
-			loc := time.UTC
-			if tz, ok := args["timezone"].(string); ok && tz != "" {
-				if l, err := time.LoadLocation(tz); err == nil {
-					loc = l
-				} else {
-					return "", fmt.Errorf("invalid timezone: %s", tz)
-				}
-			}
-
-			now := time.Now().In(loc)
-
-			if format == "unix" {
-				return fmt.Sprintf("%d", now.Unix()), nil
-			}
-
-			return now.Format(format), nil
 		},
 	},
 }
@@ -278,7 +204,10 @@ func InvokeIntelligence(username, message, url, model, apiKey string) (string, e
 
 	addMessage(map[string]interface{}{
 		"role": "system",
-		"content": "You are an assistant.",
+		"content": fmt.Sprintf(
+			"You are an assistant. Current time: %s. Use fetch from https://google.serper.dev/search?q=<query> and https://html.duckduckgo.com/html/?q=<query> for web search.",
+			time.Now().Format(time.RFC3339),
+		),
 	})
 	addMessage(map[string]interface{}{
 		"role": "user",
@@ -387,7 +316,7 @@ func main() {
 		return
 	}
 
-	model:= "openrouter/hunter-alpha"
+	model:= "nvidia/nemotron-3-super-120b-a12b:free"
 
 	//out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, model, apiKey)
 	out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
