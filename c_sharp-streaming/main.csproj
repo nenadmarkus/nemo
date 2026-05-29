@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    
+    <!-- Cross-platform behavior -->
+    <UseCurrentRuntimeIdentifier>false</UseCurrentRuntimeIdentifier>
+    <StripSymbols>true</StripSymbols>
+  </PropertyGroup>
+
+  <!-- Platform-specific feature flags -->
+  <PropertyGroup>
+    <!-- Linux features -->
+    <UseSystemHttpClient Condition="'$(RuntimeIdentifier)' == 'linux-x64' or '$(RuntimeIdentifier)' == 'linux-arm64' or '$(RuntimeIdentifier)' == 'linux-bionic-arm64'">true</UseSystemHttpClient>
+  </PropertyGroup>
+
+</Project>
