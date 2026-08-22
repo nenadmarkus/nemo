@@ -2,18 +2,18 @@ package main
 
 import (
 	"bytes"
-	"time"
-	"strings"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"os"
+	"regexp"
+	"strings"
+	"time"
 )
 
 /*
-	stolen from the picoclaw repo
+stolen from the picoclaw repo
 */
 var (
 	// Pre-compiled regexes for HTML text extraction
@@ -26,6 +26,7 @@ var (
 	reDDGLink    = regexp.MustCompile(`<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>`)
 	reDDGSnippet = regexp.MustCompile(`<a class="result__snippet[^"]*".*?>([\s\S]*?)</a>`)
 )
+
 func extractText(htmlContent string) string {
 	result := reScript.ReplaceAllLiteralString(htmlContent, "")
 	result = reStyle.ReplaceAllLiteralString(result, "")
@@ -61,7 +62,7 @@ type Tool struct {
 
 var toolRegistry = map[string]Tool{
 	"fetch": {
-		Name: "fetch",
+		Name:        "fetch",
 		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
 		Parameters: map[string]interface{}{
 			"type": "object",
@@ -70,7 +71,7 @@ var toolRegistry = map[string]Tool{
 					"type": "string",
 				},
 				"method": map[string]interface{}{
-					"type": "string",
+					"type":    "string",
 					"default": "GET",
 				},
 				"headers": map[string]interface{}{
@@ -83,11 +84,11 @@ var toolRegistry = map[string]Tool{
 					"type": "string",
 				},
 				"max_bytes": map[string]interface{}{
-					"type": "integer",
+					"type":        "integer",
 					"description": "maximum response size in bytes (default 2097152)",
 				},
 				"readable": map[string]interface{}{
-					"type": "boolean",
+					"type":        "boolean",
 					"description": "light postprocessing to extract readable content by removing script and style tags, etc.",
 				},
 			},
@@ -127,9 +128,9 @@ var toolRegistry = map[string]Tool{
 
 			// Apply token injection
 			hvPattern := []struct {
-				regex  *regexp.Regexp
-				name string
-				value  string
+				regex *regexp.Regexp
+				name  string
+				value string
 			}{
 				{regexp.MustCompile(`^https://google\.serper\.dev/search\?q=`), "X-API-KEY", os.Getenv("SERPER_API_KEY")},
 			}
@@ -210,7 +211,7 @@ func InvokeIntelligence(username, message, url, model, apiKey string) (string, e
 		),
 	})
 	addMessage(map[string]interface{}{
-		"role": "user",
+		"role":    "user",
 		"content": fmt.Sprintf("%s: %s", username, message),
 	})
 
@@ -234,21 +235,29 @@ func InvokeIntelligence(username, message, url, model, apiKey string) (string, e
 			url,
 			bytes.NewBuffer(j),
 		)
-		if err != nil { return "", err }
+		if err != nil {
+			return "", err
+		}
 
-		req.Header.Set("Authorization", "Bearer " + apiKey)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := client.Do(req)
-		if err != nil { return "", err }
+		if err != nil {
+			return "", err
+		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close() // close immediately after reading, saves memory
-		if err != nil { return "", err }
+		if err != nil {
+			return "", err
+		}
 
 		// parse request body (JSON)
 		var result map[string]interface{}
-		if err := json.Unmarshal(body, &result); err != nil { return "", err }
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", err
+		}
 
 		// extract revelant data (message)
 		choices, ok := result["choices"].([]interface{})
@@ -279,7 +288,9 @@ func InvokeIntelligence(username, message, url, model, apiKey string) (string, e
 
 			argStr := fn["arguments"].(string)
 			args := map[string]interface{}{}
-			if err := json.Unmarshal([]byte(argStr), &args); err != nil { return "", err }
+			if err := json.Unmarshal([]byte(argStr), &args); err != nil {
+				return "", err
+			}
 
 			tool, ok := toolRegistry[name]
 
@@ -316,7 +327,7 @@ func main() {
 		return
 	}
 
-	model:= "nvidia/nemotron-3-super-120b-a12b:free"
+	model := "deepseek/deepseek-v4-flash-0731"
 
 	//out, err := InvokeIntelligence("alice", "How old is Josipa Lisac?", url, model, apiKey)
 	out, err := InvokeIntelligence("alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
