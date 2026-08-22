@@ -1,22 +1,15 @@
 ## A single-shot agent loop: talks to an OpenAI-compatible chat completions
-## endpoint (OpenRouter by default), exposes one `fetch` tool to the model,
-## and guards every outbound request against SSRF.
+## endpoint (OpenRouter by default), exposes one `fetch` tool to the model
+## backed by a plain httpclient request.
 ##
-## Deliberate divergences from the Go original, forced by Nim's stdlib:
-##   * Nim's httpclient has no dial hook, so instead of resolving + validating
-##     + dialing a validated IP ourselves, every hop (the initial URL and each
-##     redirect, since redirects are followed manually) is resolved and
-##     validated immediately before the request is issued. The DNS-rebinding
-##     TOCTOU window is therefore slightly wider than in the Go version, which
-##     pins the connection to a validated IP.
-##   * Cancellation (Ctrl-C/SIGTERM) and the run deadline are enforced by
-##     checks between requests plus per-request socket timeouts, not by
-##     aborting an in-flight request mid-flight.
+## Cancellation (Ctrl-C/SIGTERM) and the run deadline are enforced by checks
+## between requests plus per-request socket timeouts, not by aborting an
+## in-flight request mid-flight.
 ##
-## Build & run:  nim c -r nimo/nimo.nim   (needs OPENROUTER_API_KEY set)
+## Build & run:  nim c -r nimo.nim   (needs OPENROUTER_API_KEY set)
 
-import std/[httpclient, json, nativesockets, net, os, re, sequtils,
-            streams, strutils, tables, times, uri]
+import std/[httpclient, json, net, os, re, streams, strutils, tables, times,
+            uri]
 
 when not defined(windows):
   from std/posix import signal, SIGINT, SIGTERM
@@ -26,9 +19,6 @@ when not defined(windows):
 const
   llmTimeoutMs* = 32_000    ## llmTimeout caps one LLM round trip.
   fetchTimeoutMs* = 15_000  ## fetchTimeout caps one tool fetch.
-  dialTimeoutMs* = 10_000   ## dialTimeout caps TCP connection establishment;
-                            ## Nim's client folds it into the per-request
-                            ## timeout (see guardedRequest).
   runTimeoutMs* = 600_000   ## runTimeout bounds the entire run, so a wedged
                             ## run cannot hang forever.
 
@@ -38,8 +28,6 @@ const
                                    ## only lower it.
   maxToolResultBytes* = 64 shl 10  ## Caps a tool result fed back into the
                                    ## conversation.
-
-  maxRedirects* = 10        ## maxRedirects bounds redirect chains.
 
   chromeUserAgent* = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " &
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -165,236 +153,38 @@ proc jstr*(node: JsonNode, key: string): string =
   let v = node{key}
   if v != nil and v.kind == JString: v.getStr else: ""
 
-# Outbound request policy: SSRF guard, redirect rules, shared clients. -------
+# Outbound requests: one shared client. --------------------------------------
 
-template isZeroRange(a: array[16, uint8], first, last: int): bool =
-  (block:
-    var allZero = true
-    for i in first .. last:
-      if a[i] != 0'u8:
-        allZero = false
-        break
-    allZero)
+var client: HttpClient
 
-proc isPublicIP*(ip: IpAddress): bool =
-  ## Reports whether ip is globally routable; loopback, private, link-local,
-  ## multicast, unspecified, broadcast and CGNAT space are not.
-  if ip.family == IpAddressFamily.IPv4:
-    let b = ip.address_v4
-    if b[0] == 127: return false                                  # loopback
-    if b[0] == 10: return false                                   # 10/8
-    if b[0] == 172 and (b[1] and 0xF0) == 16: return false        # 172.16/12
-    if b[0] == 192 and b[1] == 168: return false                  # 192.168/16
-    if b[0] == 169 and b[1] == 254: return false                  # link-local
-    if b[0] >= 224 and b[0] <= 239: return false                  # multicast
-    if b == [0'u8, 0, 0, 0]: return false                         # unspecified
-    if b == [255'u8, 255, 255, 255]: return false                 # broadcast
-    if b[0] == 100 and b[1] >= 64 and b[1] <= 127: return false   # CGNAT 100.64/10
-    result = true
-  else:
-    let b = ip.address_v6
-    # IPv4-mapped ::ffff:0:0/96 addresses follow the IPv4 rules.
-    if b.isZeroRange(0, 9) and b[10] == 0xFF'u8 and b[11] == 0xFF'u8:
-      return isPublicIP(IpAddress(family: IpAddressFamily.IPv4,
-                                  address_v4: [b[12], b[13], b[14], b[15]]))
-    if b[0] == 0xFF'u8: return false                              # ff00::/8 multicast
-    if (b[0] and 0xFE'u8) == 0xFC'u8: return false                # fc00::/7 private
-    if b[0] == 0xFE'u8 and (b[1] and 0xC0'u8) == 0x80'u8: return false # fe80::/10
-    if b.isZeroRange(0, 14) and b[15] == 1'u8: return false       # ::1 loopback
-    if b.isZeroRange(0, 15): return false                         # :: unspecified
-    # Slightly stricter than the Go original: the deprecated
-    # IPv4-compatible ::a.b.c.d space is refused outright too.
-    if b.isZeroRange(0, 11): return false
-    result = true
-
-proc lookupIPs*(host: string): seq[IpAddress] =
-  ## net.DefaultResolver.LookupIPAddr equivalent: every address the resolver
-  ## returns for host (A and AAAA alike).
-  var aiList = getAddrInfo(host, Port(0), AF_UNSPEC)
-  defer: freeAddrInfo(aiList)
-  var it = aiList
-  while it != nil:
-    result.add(parseIpAddress(getAddrString(it.ai_addr)))
-    it = it.ai_next
-
-proc assertPublicHost*(host: string) =
-  ## The SSRF gate for every outbound connection: resolve the host and
-  ## refuse non-public addresses. Validation runs right before each request,
-  ## covering redirect hops too, because redirects are followed manually
-  ## below. (See the module doc for the dial-time divergence from Go.)
-  if host == "":
-    raise newException(ValueError, "host is required")
-  let h = host.strip(chars = {'[', ']'}) # bracketed IPv6 literals
-  if isIpAddress(h):
-    let ip = parseIpAddress(h)
-    if not isPublicIP(ip):
-      raise newException(ValueError,
-        "blocked non-public address " & $ip & " for \"" & h & "\"")
-  else:
-    let ips = lookupIPs(h)
-    if ips.len == 0:
-      raise newException(IOError,
-        "host \"" & h & "\" did not resolve to any address")
-    for ip in ips:
-      if not isPublicIP(ip):
-        raise newException(ValueError,
-          "blocked non-public address " & $ip & " for \"" & h & "\"")
-
-proc proxyFromEnv*(): Proxy =
-  ## http.ProxyFromEnvironment equivalent: HTTPS_PROXY/https_proxy wins over
-  ## HTTP_PROXY/http_proxy; malformed values are ignored.
-  for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]:
-    let v = getEnv(key)
-    if v != "":
-      try:
-        return newProxy(v)
-      except CatchableError:
-        return nil
-  nil
-
-proc noProxyMatches*(host: string): bool =
-  ## Simplified NO_PROXY matching: "*" or comma-separated exact/suffix
-  ## domain entries.
-  let list = getEnv("NO_PROXY") & "," & getEnv("no_proxy")
-  if list == ",": return false
-  let h = host.strip(chars = {'[', ']'}).toLowerAscii
-  for entry0 in list.split(','):
-    var entry = entry0.strip.toLowerAscii
-    if entry == "": continue
-    if entry == "*": return true
-    if entry[0] == '.': entry = entry[1 ..^ 1]
-    if entry != "" and (h == entry or h.endsWith("." & entry)):
-      return true
-  false
-
-var
-  directClient: HttpClient
-  proxyClient: HttpClient
-  envProxy: Proxy = nil
-
-proc ensureHttpClients*() =
-  ## A shared pair of clients for all outbound traffic (LLM calls and
-  ## fetches alike); every request, initial or redirected, passes through the
-  ## host guard and the redirect policy below. TLS certificates are verified.
-  if directClient != nil:
+proc ensureHttpClient*() =
+  ## One shared client for all outbound traffic (LLM calls and fetches
+  ## alike), with TLS certificates verified.
+  if client != nil:
     return
-  let sslCtx = newContext(verifyMode = CVerifyPeer)
-  directClient = newHttpClient(userAgent = chromeUserAgent, maxRedirects = 0,
-                               sslContext = sslCtx)
-  envProxy = proxyFromEnv()
-  if envProxy != nil:
-    proxyClient = newHttpClient(userAgent = chromeUserAgent, maxRedirects = 0,
-                                sslContext = sslCtx, proxy = envProxy)
+  client = newHttpClient(userAgent = chromeUserAgent,
+                         sslContext = newContext(verifyMode = CVerifyPeer))
 
-proc pickClient*(targetHost: string): tuple[client: HttpClient, dialHost: string] =
-  ## Behind an explicit HTTP(S)_PROXY only the proxy itself is dialed, so
-  ## only the proxy's address gets validated.
-  if envProxy != nil and proxyClient != nil and not noProxyMatches(targetHost):
-    result = (proxyClient, envProxy.url.hostname)
-  else:
-    result = (directClient, targetHost)
-
-proc hostKey*(u: Uri): string =
-  let h = u.hostname.strip(chars = {'[', ']'}).toLowerAscii
-  let p = if u.port == "": (if u.scheme == "https": "443" else: "80")
-          else: u.port
-  h & ":" & p
-
-proc resolveReference(base: Uri, reference: string): Uri =
-  ## RFC 3986 §5-style resolution for redirect Location values (covers
-  ## absolute URLs, network-path, absolute-path, relative-path, and
-  ## query/fragment-only references).
-  if reference == "":
-    return base
-  let r = parseUri(reference)
-  if r.scheme != "":
-    return r
-  if reference[0] == '#':
-    result = base
-    result.anchor = r.anchor
-    return
-  if reference[0] == '?':
-    result = base
-    result.query = r.query
-    result.anchor = r.anchor
-    return
-  if r.hostname != "":
-    result = r
-    result.scheme = base.scheme
-    return
-  result = base
-  if reference[0] == '/':
-    result.path = r.path
-  else:
-    let idx = base.path.rfind('/')
-    if idx < 0:
-      result.path = "/" & r.path
-    else:
-      result.path = base.path[0 .. idx] & r.path
-  result.query = r.query
-  result.anchor = r.anchor
-
-proc guardedRequest*(ctx: RunContext, meth0, urlStr, body0: string,
-                     headers0: seq[tuple[name, value: string]],
-                     perCallTimeout: Duration): Response =
-  ## Makes one policy-checked HTTP request: http/https only, SSRF-guarded
-  ## host resolution (or a guarded proxy host when HTTP(S)_PROXY is in
-  ## effect), a bounded redirect chain (Go: guardedDialContext +
-  ## checkRedirect), and a per-request deadline of
+proc httpRequest*(ctx: RunContext, meth, urlStr, body: string,
+                  headers: seq[tuple[name, value: string]],
+                  perCallTimeout: Duration): Response =
+  ## Makes one HTTP request: http/https only, with a per-request deadline of
   ## min(perCallTimeout, remaining run budget).
-  var current = parseUri(urlStr)
-  var redirectsFollowed = 0
-  let originHostKey = hostKey(current)
-  var meth = meth0
-  var body = body0
-  var headers = headers0
+  let u = parseUri(urlStr)
+  if u.scheme != "http" and u.scheme != "https":
+    raise newException(ValueError,
+      "scheme \"" & u.scheme & "\" not allowed (http/https only)")
+  let cerr = ctxErr(ctx)
+  if cerr != nil:
+    raise cerr
 
-  while true:
-    let cerr = ctxErr(ctx)
-    if cerr != nil:
-      raise cerr
+  client.timeout = min(perCallTimeout.inMilliseconds.int, remainingMs(ctx))
 
-    if current.scheme != "http" and current.scheme != "https":
-      if redirectsFollowed == 0:
-        raise newException(ValueError,
-          "scheme \"" & current.scheme & "\" not allowed (http/https only)")
-      raise newException(ValueError,
-        "blocked redirect to scheme \"" & current.scheme & "\"")
+  let httpHeaders = newHttpHeaders()
+  for h in headers:
+    httpHeaders[h.name] = h.value
 
-    let picked = pickClient(current.hostname)
-    doAssert picked.client != nil, "call ensureHttpClients() first"
-    assertPublicHost(picked.dialHost)
-
-    let ms = min(perCallTimeout.inMilliseconds.int, remainingMs(ctx))
-    if ms <= 0:
-      raise newException(TimeoutError, "context deadline exceeded")
-    picked.client.timeout = ms
-
-    let httpHeaders = newHttpHeaders()
-    for h in headers:
-      httpHeaders[h.name] = h.value
-
-    let resp = picked.client.request($current, meth, body, httpHeaders)
-
-    if resp.code in {Http301, Http302, Http303, Http307, Http308}:
-      let location = resp.headers.getOrDefault("location")
-      if location != "":
-        # checkRedirect: bounded chain length; scheme and host of the next
-        # hop are re-validated at the top of the loop.
-        if redirectsFollowed >= maxRedirects:
-          raise newException(ValueError,
-            "stopped after " & $maxRedirects & " redirects")
-        inc redirectsFollowed
-        current = resolveReference(current, location)
-        if hostKey(current) != originHostKey:
-          # Go's client strips Authorization on cross-host redirects.
-          headers = headers.filterIt(it.name.toLowerAscii != "authorization")
-        if resp.code in {Http301, Http302, Http303} and meth != "GET" and meth != "HEAD":
-          meth = "GET"
-          body = ""
-        continue
-
-    return resp
+  result = client.request(urlStr, meth, body, httpHeaders)
 
 # tool defs -------------------------------------------------------------------
 
@@ -436,13 +226,6 @@ proc fetchHandler*(ctx: RunContext, args: JsonNode): string =
     raise newException(ValueError, "url is required")
   let urlStr = urlNode.getStr
 
-  # http/https only; the address itself is enforced per request by
-  # guardedRequest, which covers redirect hops too.
-  let u = parseUri(urlStr)
-  if u.scheme != "http" and u.scheme != "https":
-    raise newException(ValueError,
-      "scheme \"" & u.scheme & "\" not allowed (http/https only)")
-
   var meth = "GET"
   let m = args{"method"}
   if m != nil and m.kind == JString and m.getStr != "":
@@ -468,8 +251,8 @@ proc fetchHandler*(ctx: RunContext, args: JsonNode): string =
     if n > 0 and n < maxToolResponseBytes:
       maxBytes = n
 
-  let resp = guardedRequest(ctx, meth, urlStr, body, headers,
-                            initDuration(milliseconds = fetchTimeoutMs))
+  let resp = httpRequest(ctx, meth, urlStr, body, headers,
+                         initDuration(milliseconds = fetchTimeoutMs))
   let data = readUpTo(resp.bodyStream, maxBytes)
 
   let r = args{"readable"}
@@ -502,7 +285,7 @@ proc buildToolSpecs*(): JsonNode =
 
 proc invokeIntelligence*(ctx: RunContext, username, message, url, model,
                          apiKey: string): string =
-  ensureHttpClients()
+  ensureHttpClient()
 
   let messages = newJArray()
 
@@ -533,7 +316,7 @@ proc invokeIntelligence*(ctx: RunContext, username, message, url, model,
       "tool_choice": "auto"
     }
 
-    let resp = guardedRequest(ctx, "POST", url, $reqBody, @[
+    let resp = httpRequest(ctx, "POST", url, $reqBody, @[
       ("Authorization", "Bearer " & apiKey),
       ("Content-Type", "application/json"),
     ], initDuration(milliseconds = llmTimeoutMs))
@@ -621,7 +404,7 @@ proc main() =
 
   # Ctrl-C/SIGTERM cancels the run; runTimeout bounds it.
   installSignalHandlers()
-  ensureHttpClients()
+  ensureHttpClient()
 
   let url = "https://openrouter.ai/api/v1/chat/completions"
   let model = "deepseek/deepseek-v4-flash-0731"
