@@ -55,34 +55,26 @@ func extractText(htmlContent string) string {
 	return strings.Join(cleanLines, "\n")
 }
 
-/*
-outbound hardening: timeouts, size caps and an SSRF/redirect policy
-applied to every request this program makes (both the LLM calls and
-the model-driven fetch tool). See httpClient, guardedDialContext and
-checkRedirect below.
-*/
+// Timeouts and size limits for outbound requests.
 const (
-	// llmTimeout caps a single chat-completions round trip.
+	// llmTimeout caps one LLM round trip.
 	llmTimeout = 32 * time.Second
-	// fetchTimeout caps a single tool fetch.
+	// fetchTimeout caps one tool fetch.
 	fetchTimeout = 15 * time.Second
 	// dialTimeout caps TCP connection establishment.
 	dialTimeout = 10 * time.Second
-	// runTimeout bounds the whole agentic run (worst case: 32 iterations
-	// of LLM call plus tool fetches), so a wedged run cannot hang forever.
+	// runTimeout bounds the entire run, so a wedged run cannot hang forever.
 	runTimeout = 10 * time.Minute
 
-	// maxLLMResponseBytes caps a single LLM response body.
+	// maxLLMResponseBytes caps one LLM response body.
 	maxLLMResponseBytes int64 = 1 << 20
-	// maxToolResponseBytes is the hard cap for tool fetch bodies; it is
-	// also the default, and a model-supplied max_bytes can only ask for
-	// less, never more.
+	// maxToolResponseBytes is the hard cap (and default) for tool fetch
+	// bodies; model-supplied max_bytes can only lower it.
 	maxToolResponseBytes int64 = 2 << 20
-	// maxToolResultBytes caps a tool result as it is fed back into the
-	// conversation, so repeated fetches cannot blow up context and cost.
+	// maxToolResultBytes caps a tool result fed back into the conversation.
 	maxToolResultBytes = 64 << 10
 
-	// maxRedirects bounds redirect chains (like the default client does).
+	// maxRedirects bounds redirect chains.
 	maxRedirects = 10
 )
 
@@ -90,8 +82,8 @@ const (
 tool defs
 */
 
-// Tool handlers receive the run context so a Ctrl-C, the overall run
-// deadline, or the per-request timeout cancels in-flight fetches.
+// Tool is a function the model may call; ctx carries the run's deadline
+// and cancellation.
 type Tool struct {
 	Name        string
 	Description string
@@ -140,9 +132,8 @@ var toolRegistry = map[string]Tool{
 				return "", fmt.Errorf("url is required")
 			}
 
-			// Reject non-http(s) URLs up front (file:, gopher:, ...). The
-			// address itself is enforced at dial time by guardedDialContext,
-			// which also covers every redirect hop.
+			// http/https only; the address itself is enforced at dial time
+			// by guardedDialContext, which covers redirect hops too.
 			u, err := url.Parse(urlStr)
 			if err != nil {
 				return "", fmt.Errorf("invalid url: %w", err)
@@ -179,21 +170,14 @@ var toolRegistry = map[string]Tool{
 				}
 			}
 
-			// NOTE: there is deliberately no credential-injection mechanism
-			// yet (the old Serper X-API-KEY hack lived here). The plan is to
-			// drive it from env/JSON config later; until then fetches carry
-			// no credentials beyond what the model itself puts in "headers".
-
 			res, err := httpClient.Do(req)
 			if err != nil {
 				return "", err
 			}
 			defer res.Body.Close()
 
-			// max_bytes is clamped to the hard cap: a hallucinated huge
-			// value cannot turn this tool into a memory-exhaustion vector.
-			// Smaller values are honored; absent/invalid falls back to the
-			// cap (the old 2 MiB default).
+			// Clamp the model-supplied cap; only values below the hard cap
+			// are honored.
 			maxBytes := maxToolResponseBytes
 			if mb, ok := args["max_bytes"].(float64); ok && mb > 0 && mb < float64(maxToolResponseBytes) {
 				maxBytes = int64(mb)
@@ -235,23 +219,18 @@ func buildToolSpecs() []map[string]interface{} {
 	return tools
 }
 
-/*
-outbound request policy (SSRF guard, redirect policy, shared client)
-*/
+// Outbound request policy: SSRF guard, redirect rules, shared client.
 
 var guardedDialer = &net.Dialer{
 	Timeout:   dialTimeout,
 	KeepAlive: 30 * time.Second,
 }
 
-// guardedDialContext is the SSRF gate for every outbound connection: the
-// hostname from the URL is resolved here, every resolved address is checked,
-// and the connection is then made to a validated IP directly (never
-// re-resolved), so neither redirects nor DNS rebinding can smuggle a request
-// to loopback, private, or link-local addresses (cloud metadata endpoints,
-// local admin panels, internal services). Note: requests routed through an
-// explicit HTTP(S)_PROXY are governed by that proxy - only the proxy's own
-// address is dialed by us.
+// guardedDialContext is the SSRF gate for every outbound connection: it
+// resolves the host, refuses non-public addresses, and dials a validated
+// IP directly, so neither redirects nor DNS rebinding can reach internal
+// endpoints. Behind an explicit HTTP(S)_PROXY only the proxy itself is
+// dialed by us.
 func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -274,8 +253,8 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 		return nil, fmt.Errorf("host %q did not resolve to any address", host)
 	}
 
-	// Dial exactly the addresses we validated (TLS keeps using the URL
-	// hostname for SNI and certificate verification).
+	// Dial a validated IP; TLS still uses the URL hostname for SNI and
+	// certificate verification.
 	var lastErr error
 	for _, da := range dialAddrs {
 		conn, err := guardedDialer.DialContext(ctx, network, da)
@@ -287,10 +266,8 @@ func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	return nil, lastErr
 }
 
-// isPublicIP reports whether ip is a globally routable address. Everything
-// else - loopback, RFC1918 private, link-local (including cloud metadata at
-// 169.254.169.254), multicast, unspecified, broadcast and carrier-grade NAT
-// space - is refused.
+// isPublicIP reports whether ip is globally routable; loopback, private,
+// link-local, multicast, unspecified, broadcast and CGNAT space are not.
 func isPublicIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
@@ -303,13 +280,9 @@ func isPublicIP(ip net.IP) bool {
 	return true
 }
 
-// checkRedirect re-applies the outbound policy on every redirect hop:
-// http/https only and a bounded chain length. (Go itself already strips
-// the Authorization header on cross-host redirects. There is no injected
-// credential to protect yet - see the note in the fetch handler - and when
-// config-driven injection arrives, the simple rule for such requests is
-// to not follow redirects at all, e.g. by sending them with
-// CheckRedirect: func(...) error { return http.ErrUseLastResponse }.)
+// checkRedirect applies the outbound policy to every redirect hop:
+// http/https only, bounded chain length. (Go itself strips Authorization
+// on cross-host redirects.)
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
 		return fmt.Errorf("stopped after %d redirects", maxRedirects)
@@ -320,10 +293,9 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// httpClient is the single shared client for all outbound traffic (tool
-// fetches and LLM calls): connections are pooled, and every request -
-// initial or redirected - goes through guardedDialContext and
-// checkRedirect. Per-request deadlines come from the caller's context.
+// httpClient is shared by all outbound traffic (LLM calls and fetches);
+// every request, initial or redirected, passes the dial guard and the
+// redirect policy. Per-request deadlines come from the caller's context.
 var httpClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -337,13 +309,10 @@ var httpClient = &http.Client{
 	CheckRedirect: checkRedirect,
 }
 
-/*
-	small helpers
-*/
+// Small helpers.
 
-// readCapped reads at most limit+1 bytes and reports an error when the body
-// is larger, so an oversized response fails loudly instead of being silently
-// truncated into invalid JSON.
+// readCapped reads up to limit bytes, erroring if the body is larger
+// (rather than truncating it into invalid JSON).
 func readCapped(r io.Reader, limit int64) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
@@ -412,7 +381,6 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			return "", err
 		}
 
-		// construct the request
 		reqBody := map[string]interface{}{
 			"model":       model,
 			"messages":    messages,
@@ -425,11 +393,9 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			return "", err
 		}
 
-		// per-call deadline nested inside the run context, so a single
-		// hung call cannot stall the run and Ctrl-C always wins
+		// Per-call deadline within the run context.
 		reqCtx, cancel := context.WithTimeout(ctx, llmTimeout)
 
-		// do the request
 		req, err := http.NewRequestWithContext(
 			reqCtx,
 			http.MethodPost,
@@ -457,14 +423,12 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			return "", err
 		}
 
-		// surface upstream failures with their status and body instead of
-		// the old useless "invalid or empty choices"
+		// Surface upstream failures with their status and body.
 		if resp.StatusCode != http.StatusOK {
 			return "", fmt.Errorf("upstream %s: %s", resp.Status,
 				truncateUTF8(strings.TrimSpace(string(body)), 1024, " ...[truncated]"))
 		}
 
-		// parse request body (JSON)
 		var result map[string]interface{}
 		if err := json.Unmarshal(body, &result); err != nil {
 			return "", fmt.Errorf("invalid JSON from upstream: %w", err)
@@ -473,8 +437,7 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			return "", fmt.Errorf("upstream error: %s", msg)
 		}
 
-		// extract relevant data (message) - checked assertions only: a
-		// malformed or unexpected shape must error, never panic
+		// Malformed responses error out rather than panic.
 		choices, ok := result["choices"].([]interface{})
 		if !ok || len(choices) == 0 {
 			return "", fmt.Errorf("invalid or empty choices in response")
@@ -490,12 +453,10 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 
 		addMessage(msg)
 
-		// are there tool calls? (a nil/absent/mistyped value simply means
-		// "final answer")
+		// No (or malformed) tool_calls: the message content is the final answer.
 		toolCalls, ok := msg["tool_calls"].([]interface{})
 		if !ok || len(toolCalls) == 0 {
 			if content, ok := msg["content"].(string); ok {
-				// no tool calls, final answer
 				return content, nil
 			}
 
@@ -514,7 +475,7 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			args := map[string]interface{}{}
 			var toolResult string
 			if err := json.Unmarshal([]byte(argStr), &args); err != nil {
-				// feed the parse failure back to the model instead of dying
+				// Report bad arguments back to the model.
 				toolResult = fmt.Sprintf("invalid tool arguments: %v", err)
 			} else if tool, ok := toolRegistry[name]; ok {
 				out, err := tool.Handler(ctx, args)
@@ -527,7 +488,6 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 				toolResult = "unknown tool"
 			}
 
-			// never let a tool result flood the conversation/context
 			toolResult = truncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
 
 			addMessage(map[string]interface{}{
@@ -543,8 +503,7 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 
 func main() {
 
-	// Ctrl-C / SIGTERM cancels the whole run; runTimeout bounds it even if
-	// no signal arrives.
+	// Ctrl-C/SIGTERM cancels the run; runTimeout bounds it.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
