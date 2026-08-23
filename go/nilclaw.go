@@ -383,7 +383,7 @@ type sseResult struct {
 // what went wrong instead of silently succeeding with a partial reply. Chunks
 // that carry neither tokens nor tool calls are tolerated (providers emit a
 // final empty-choices usage chunk before [DONE]).
-func readSSEStream(r io.Reader, onReasoning, onContent func(string)) (sseResult, error) {
+func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (sseResult, error) {
 	assistant := map[string]any{"role": "assistant"}
 	var content []string
 	// []any (of map[string]any entries) so the value survives a round trip
@@ -446,8 +446,10 @@ func readSSEStream(r io.Reader, onReasoning, onContent func(string)) (sseResult,
 
 		var chunk map[string]any
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			fmt.Fprintf(os.Stderr, "[llm]\nskipped malformed stream chunk: %s\n",
-				truncateUTF8(data, 256, " ..."))
+			if onSystem != nil {
+				onSystem(fmt.Sprintf("skipped malformed stream chunk: %s",
+					truncateUTF8(data, 256, " ...")))
+			}
 			continue
 		}
 
@@ -463,7 +465,9 @@ func readSSEStream(r io.Reader, onReasoning, onContent func(string)) (sseResult,
 
 		if fr, ok := first["finish_reason"].(string); ok && fr != "" {
 			finishReason = fr
-			fmt.Fprintf(os.Stderr, "[llm]\nfinish_reason: %s\n", fr)
+			if onSystem != nil {
+				onSystem("finish_reason: " + fr)
+			}
 		}
 
 		// Standard streaming shape is delta.tool_calls / delta.content; some
@@ -512,8 +516,9 @@ func readSSEStream(r io.Reader, onReasoning, onContent func(string)) (sseResult,
 					}
 				}
 				if len(unknown) > 0 {
-					fmt.Fprintf(os.Stderr, "[llm]\nunhandled delta keys: %s\n",
-						strings.Join(unknown, ","))
+					if onSystem != nil {
+						onSystem("unhandled delta keys: " + strings.Join(unknown, ","))
+					}
 				}
 			}
 		}
@@ -546,7 +551,7 @@ func llmCallStream(
 	ctx context.Context,
 	url, apiKey string,
 	reqBody map[string]any,
-	onReasoning, onContent func(string),
+	onReasoning, onContent, onSystem func(string),
 ) (sseResult, error) {
 
 	reqBody["stream"] = true
@@ -584,10 +589,12 @@ func llmCallStream(
 					err = fmt.Errorf("upstream %s: %s", resp.Status,
 						truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
 				}
-				fmt.Fprintf(os.Stderr, "[llm]\nupstream %s: %s\n", resp.Status,
-					truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
+				if onSystem != nil {
+					onSystem(fmt.Sprintf("upstream %s: %s", resp.Status,
+						truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]")))
+				}
 			} else {
-				res, readErr := readSSEStream(resp.Body, onReasoning, onContent)
+				res, readErr := readSSEStream(resp.Body, onReasoning, onContent, onSystem)
 				resp.Body.Close()
 				cancel()
 
@@ -621,8 +628,10 @@ func llmCallStream(
 		if delay > maxBackoff {
 			delay = maxBackoff
 		}
-		fmt.Fprintf(os.Stderr, "[llm]\nattempt %d/%d failed: %v; retrying in %.0fs\n",
-			attempt+1, maxRetries, err, delay.Seconds())
+		if onSystem != nil {
+			onSystem(fmt.Sprintf("attempt %d/%d failed: %v; retrying in %.0fs",
+				attempt+1, maxRetries, err, delay.Seconds()))
+		}
 		if err := sleepCtx(ctx, delay); err != nil {
 			return sseResult{}, err
 		}
@@ -673,7 +682,11 @@ func handleToolCall(ctx context.Context, i int, tci any) (callID string, out str
 	return callID, result, nil
 }
 
-func InvokeIntelligence(ctx context.Context, username, message, url, model, apiKey string) (string, error) {
+func InvokeIntelligence(
+	ctx context.Context,
+	username, message, url, model, apiKey string,
+	onReasoning, onContent, onSystem func(string),
+) error {
 
 	var messages []map[string]any
 
@@ -698,7 +711,7 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 	const maxToolIterations = 32
 	for range maxToolIterations {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return err
 		}
 
 		reqBody := map[string]any{
@@ -712,30 +725,10 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			},
 		}
 
-		// Stream the assistant reply: prefix markers delineate reasoning
-		// tokens from output tokens.
-		var streamedReasoning, streamedOutput bool
-		var content []string
-
-		res, err := llmCallStream(ctx, url, apiKey, reqBody,
-			func(s string) {
-				if !streamedReasoning {
-					fmt.Fprintln(os.Stdout, "[reasoning]")
-					streamedReasoning = true
-				}
-				fmt.Fprint(os.Stdout, s)
-			},
-			func(s string) {
-				if !streamedOutput {
-					fmt.Fprintln(os.Stdout, "[output]")
-					streamedOutput = true
-				}
-				fmt.Fprint(os.Stdout, s)
-				content = append(content, s)
-			},
-		)
+		// Stream the assistant reply through the caller's callbacks.
+		res, err := llmCallStream(ctx, url, apiKey, reqBody, onReasoning, onContent, onSystem)
 		if err != nil {
-			return "", err
+			return err
 		}
 		msg := res.assistant
 
@@ -744,14 +737,15 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 		// No (or malformed) tool_calls: the streamed content is the answer.
 		toolCalls, _ := msg["tool_calls"].([]any)
 		if len(toolCalls) == 0 {
-			if len(content) == 0 {
-				fmt.Fprintf(os.Stderr,
-					"[llm]\nstream ended with no content and no tool calls (finish_reason: %q)\n",
-					res.finishReason)
-				return "", fmt.Errorf("empty assistant reply (no content, no tool calls; finish_reason: %q)",
+			if msg["content"] == nil {
+				if onSystem != nil {
+					onSystem(fmt.Sprintf("stream ended with no content and no tool calls (finish_reason: %q)",
+						res.finishReason))
+				}
+				return fmt.Errorf("empty assistant reply (no content, no tool calls; finish_reason: %q)",
 					res.finishReason)
 			}
-			return strings.Join(content, ""), nil
+			return nil
 		}
 
 		// process tool calls
@@ -788,7 +782,7 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 		}
 	}
 
-	return "", fmt.Errorf("max iterations reached")
+	return fmt.Errorf("max iterations reached")
 }
 
 func main() {
@@ -810,8 +804,34 @@ func main() {
 
 	model := "deepseek/deepseek-v4-flash-0731"
 
+	// Stream callbacks: render reasoning/output tokens to stdout with one-time
+	// header lines, and system/status diagnostics to stderr with an [llm]
+	// header.
+	var streamedReasoning, streamedOutput bool
+
+	onReasoning := func(s string) {
+		if !streamedReasoning {
+			fmt.Fprintln(os.Stdout, "[reasoning]")
+			streamedReasoning = true
+		}
+		fmt.Fprint(os.Stdout, s)
+	}
+
+	onContent := func(s string) {
+		if !streamedOutput {
+			fmt.Fprintln(os.Stdout, "[output]")
+			streamedOutput = true
+		}
+		fmt.Fprint(os.Stdout, s)
+	}
+
+	onSystem := func(s string) {
+		fmt.Fprintf(os.Stderr, "[llm]\n%s\n", s)
+	}
+
 	//out, err := InvokeIntelligence(ctx, "alice", "How old is Josipa Lisac?", url, model, apiKey)
-	_, err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
+	err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey,
+		onReasoning, onContent, onSystem)
 	//out, err := InvokeIntelligence(ctx, "alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
