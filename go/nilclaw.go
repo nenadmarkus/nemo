@@ -699,6 +699,7 @@ func InvokeIntelligence(
 		"role": "system",
 		"content": fmt.Sprintf(
 			"You are an assistant. Current time: %s. Use fetch from https://html.duckduckgo.com/html/?q=<query> for web search.",
+			//"You are an assistant. Current time: %s. Use fetch from https://drone.nenadmarkus.com/search?q=<query> for web search.",
 			time.Now().Format(time.RFC3339),
 		),
 	})
