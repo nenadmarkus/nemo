@@ -686,6 +686,7 @@ func InvokeIntelligence(
 	ctx context.Context,
 	username, message, url, model, apiKey string,
 	onReasoning, onContent, onSystem func(string),
+	onTool func(callID, name, args string, ok bool, detail string),
 ) error {
 
 	var messages []map[string]any
@@ -751,28 +752,20 @@ func InvokeIntelligence(
 		// process tool calls
 		for n, tci := range toolCalls {
 			callID, toolResult, callErr := handleToolCall(ctx, n, tci)
-			toolResult = truncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
 
-			name := ""
-			argStr := ""
-			if tciMap, ok := tci.(map[string]any); ok {
-				if fn, ok := tciMap["function"].(map[string]any); ok {
-					name, _ = fn["name"].(string)
-					argStr, _ = fn["arguments"].(string)
+			if onTool != nil {
+				name := ""
+				argStr := ""
+				if tciMap, ok := tci.(map[string]any); ok {
+					if fn, ok := tciMap["function"].(map[string]any); ok {
+						name, _ = fn["name"].(string)
+						argStr, _ = fn["arguments"].(string)
+					}
 				}
+				onTool(callID, name, argStr, callErr == nil, toolResult)
 			}
-			argOneLine := strings.ReplaceAll(argStr, "\n", " ")
-			argOneLine = truncateUTF8(argOneLine, 128, " ...")
 
-			fmt.Fprintln(os.Stdout, "")
-			fmt.Fprintf(os.Stdout, "[tool: %s]\n%s\n", name, argOneLine)
-			if callErr != nil {
-				fmt.Fprintf(os.Stdout, "[tool: %s] error:\n%s", name,
-					truncateUTF8(toolResult, 512, " ..."))
-			} else {
-				fmt.Fprintf(os.Stdout, "[tool: %s] ok:\n%s", name,
-					truncateUTF8(toolResult, 128, " ..."))
-			}
+			toolResult = truncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
 
 			addMessage(map[string]any{
 				"role":         "tool",
@@ -829,9 +822,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[llm]\n%s\n", s)
 	}
 
+	onTool := func(callID, name, args string, ok bool, detail string) {
+		label := name
+		if callID != "" {
+			label = callID + " " + name
+		}
+		argOneLine := strings.ReplaceAll(args, "\n", " ")
+		fmt.Fprintln(os.Stdout, "")
+		fmt.Fprintf(os.Stdout, "[tool: %s]\n%s\n", label, truncateUTF8(argOneLine, 128, " ..."))
+		if ok {
+			fmt.Fprintf(os.Stdout, "[tool: %s] ok:\n%s", label,
+				truncateUTF8(detail, 128, " ..."))
+		} else {
+			fmt.Fprintf(os.Stdout, "[tool: %s] error:\n%s", label,
+				truncateUTF8(detail, 512, " ..."))
+		}
+	}
+
 	//out, err := InvokeIntelligence(ctx, "alice", "How old is Josipa Lisac?", url, model, apiKey)
 	err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey,
-		onReasoning, onContent, onSystem)
+		onReasoning, onContent, onSystem, onTool)
 	//out, err := InvokeIntelligence(ctx, "alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
