@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -59,6 +60,10 @@ func extractText(htmlContent string) string {
 const (
 	// llmTimeout caps one LLM round trip.
 	llmTimeout = 32 * time.Second
+	// llmStreamTimeout caps one streaming LLM round trip. Streaming needs more
+	// headroom than a one-shot call: thinking models can emit nothing for a
+	// while before the first token, and [DONE] only arrives at the very end.
+	llmStreamTimeout = 5 * time.Minute
 	// fetchTimeout caps one tool fetch.
 	fetchTimeout = 15 * time.Second
 	// runTimeout bounds the entire run, so a wedged run cannot hang forever.
@@ -363,26 +368,288 @@ func llmCall(ctx context.Context, url, apiKey string, payload []byte) (int, []by
 	}
 }
 
+// sseResult carries the assembled assistant message plus how the stream ended:
+// whether any token streamed and the last finish_reason seen.
+type sseResult struct {
+	assistant    map[string]any
+	streamed     bool
+	finishReason string
+}
+
+// readSSEStream reads an OpenAI-style SSE response, calling onReasoning and
+// onContent for streamed deltas and assembling tool_call fragments across
+// chunks. A clean EOF or [DONE] ends the stream normally; anything else (a
+// dropped connection, a timeout) is returned as an error so callers can see
+// what went wrong instead of silently succeeding with a partial reply. Chunks
+// that carry neither tokens nor tool calls are tolerated (providers emit a
+// final empty-choices usage chunk before [DONE]).
+func readSSEStream(r io.Reader, onReasoning, onContent func(string)) (sseResult, error) {
+	assistant := map[string]any{"role": "assistant"}
+	var content []string
+	// []any (of map[string]any entries) so the value survives a round trip
+	// through map[string]any and can be asserted back as []any by callers.
+	var toolCalls []any
+	streamed := false
+	finishReason := ""
+
+	addToolCall := func(tc any) {
+		tcm, ok := tc.(map[string]any)
+		if !ok {
+			return
+		}
+		idx := 0
+		if i, ok := tcm["index"].(float64); ok {
+			idx = int(i)
+		}
+		for len(toolCalls) <= idx {
+			toolCalls = append(toolCalls, map[string]any{})
+		}
+		call, _ := toolCalls[idx].(map[string]any)
+		if id, ok := tcm["id"].(string); ok && id != "" {
+			call["id"] = id
+		}
+		if fn, ok := tcm["function"].(map[string]any); ok {
+			fnObj, _ := call["function"].(map[string]any)
+			if fnObj == nil {
+				fnObj = map[string]any{}
+			}
+			if name, ok := fn["name"].(string); ok && name != "" {
+				fnObj["name"] = name
+			}
+			if args, ok := fn["arguments"].(string); ok && args != "" {
+				prev, _ := fnObj["arguments"].(string)
+				fnObj["arguments"] = prev + args
+			}
+			call["function"] = fnObj
+		}
+		toolCalls[idx] = call
+	}
+
+	reader := bufio.NewReader(r)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return sseResult{}, fmt.Errorf("stream read error: %v", err)
+		}
+
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			fmt.Fprintf(os.Stderr, "[llm] skipped malformed stream chunk: %s\n",
+				truncateUTF8(data, 256, " ..."))
+			continue
+		}
+
+		choices, ok := chunk["choices"].([]any)
+		if !ok || len(choices) == 0 {
+			// Empty-choices chunk (e.g. the final usage chunk): nothing to do.
+			continue
+		}
+		first, ok := choices[0].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if fr, ok := first["finish_reason"].(string); ok && fr != "" {
+			finishReason = fr
+			fmt.Fprintf(os.Stderr, "[llm] finish_reason: %s\n", fr)
+		}
+
+		// Standard streaming shape is delta.tool_calls / delta.content; some
+		// providers emit a full message object instead (message.tool_calls),
+		// so accept both.
+		delta, hasDelta := first["delta"].(map[string]any)
+		msgObj, hasMsg := first["message"].(map[string]any)
+		handled := false
+
+		if hasDelta {
+			reasoning := ""
+			if r, ok := delta["reasoning"].(string); ok {
+				reasoning = r
+			} else if r, ok := delta["reasoning_content"].(string); ok {
+				reasoning = r
+			}
+			if reasoning != "" {
+				handled = true
+				streamed = true
+				if onReasoning != nil {
+					onReasoning(reasoning)
+				}
+			}
+			if c, ok := delta["content"].(string); ok && c != "" {
+				handled = true
+				streamed = true
+				if onContent != nil {
+					onContent(c)
+				}
+				content = append(content, c)
+			}
+			if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
+				handled = true
+				streamed = true
+				for _, tc := range calls {
+					addToolCall(tc)
+				}
+			}
+			if !handled {
+				var unknown []string
+				for k := range delta {
+					switch k {
+					case "role", "content", "reasoning", "reasoning_content", "tool_calls":
+					default:
+						unknown = append(unknown, k)
+					}
+				}
+				if len(unknown) > 0 {
+					fmt.Fprintf(os.Stderr, "[llm] unhandled delta keys: %s\n",
+						strings.Join(unknown, ","))
+				}
+			}
+		}
+		if hasMsg {
+			if calls, ok := msgObj["tool_calls"].([]any); ok && len(calls) > 0 {
+				handled = true
+				streamed = true
+				for _, tc := range calls {
+					addToolCall(tc)
+				}
+			}
+		}
+	}
+
+	if len(content) > 0 {
+		assistant["content"] = strings.Join(content, "")
+	}
+	if len(toolCalls) > 0 {
+		assistant["tool_calls"] = toolCalls
+	}
+	return sseResult{assistant: assistant, streamed: streamed, finishReason: finishReason}, nil
+}
+
+// llmCallStream posts a streaming chat request (stream: true) and feeds
+// reasoning and content tokens to the callbacks as they arrive. It returns the
+// assembled assistant message plus stream-end metadata. Connect errors and
+// 429/5xx statuses are retried with capped exponential backoff; a mid-stream
+// failure that already delivered tokens is surfaced instead.
+func llmCallStream(
+	ctx context.Context,
+	url, apiKey string,
+	reqBody map[string]any,
+	onReasoning, onContent func(string),
+) (sseResult, error) {
+
+	reqBody["stream"] = true
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return sseResult{}, err
+	}
+
+	for attempt := 0; ; attempt++ {
+		var resp *http.Response
+
+		reqCtx, cancel := context.WithTimeout(ctx, llmStreamTimeout)
+
+		req, err := http.NewRequestWithContext(
+			reqCtx,
+			http.MethodPost,
+			url,
+			bytes.NewReader(payload),
+		)
+		if err != nil {
+			cancel()
+			return sseResult{}, err
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err == nil {
+			if resp.StatusCode != http.StatusOK {
+				var respBody []byte
+				respBody, err = readCapped(resp.Body, maxLLMResponseBytes)
+				resp.Body.Close()
+				cancel()
+				if err == nil {
+					err = fmt.Errorf("upstream %s: %s", resp.Status,
+						truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
+				}
+				fmt.Fprintf(os.Stderr, "[llm] upstream %s: %s\n", resp.Status,
+					truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
+			} else {
+				res, readErr := readSSEStream(resp.Body, onReasoning, onContent)
+				resp.Body.Close()
+				cancel()
+
+				if readErr == nil {
+					// Finished cleanly, or broke off after tokens already
+					// streamed (nothing to retry: the caller saw partial text).
+					return res, nil
+				}
+				if res.streamed {
+					return sseResult{}, readErr
+				}
+				// Stream died before delivering anything; treat as transient.
+				err = readErr
+			}
+		} else {
+			cancel()
+		}
+
+		if attempt >= maxRetries || ctx.Err() != nil {
+			return sseResult{}, err
+		}
+
+		delay := time.Second << attempt
+		if resp != nil {
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs >= 0 {
+					delay = time.Duration(secs) * time.Second
+				}
+			}
+		}
+		if delay > maxBackoff {
+			delay = maxBackoff
+		}
+		fmt.Fprintf(os.Stderr, "[llm] attempt %d/%d failed: %v; retrying in %.0fs\n",
+			attempt+1, maxRetries, err, delay.Seconds())
+		if err := sleepCtx(ctx, delay); err != nil {
+			return sseResult{}, err
+		}
+	}
+}
+
 // handleToolCall runs one tool call for the model, returning the call ID
-// (synthesized when missing) and the result text. Malformed entries are
-// reported back to the model instead of being forwarded as an empty message.
-func handleToolCall(ctx context.Context, i int, tci any) (string, string) {
+// (synthesized when missing), the result text, and an error when the call
+// itself failed. Malformed entries are reported back to the model instead of
+// being forwarded as an empty message.
+func handleToolCall(ctx context.Context, i int, tci any) (callID string, out string, callErr error) {
 	call, ok := tci.(map[string]any)
 	if !ok {
 		if raw, err := json.Marshal(tci); err == nil {
-			return "", fmt.Sprintf("invalid tool call: %s", truncateUTF8(string(raw), 512, " ..."))
+			return "", fmt.Sprintf("invalid tool call: %s", truncateUTF8(string(raw), 512, " ...")), nil
 		}
-		return "", "invalid tool call: expected an object with id and function"
+		return "", "invalid tool call: expected an object with id and function", nil
 	}
 
-	callID, _ := call["id"].(string)
+	callID, _ = call["id"].(string)
 	if callID == "" {
 		callID = fmt.Sprintf("call_%d", i)
 	}
 
 	fn, ok := call["function"].(map[string]any)
 	if !ok {
-		return callID, "invalid tool call: function missing or not an object"
+		return callID, "invalid tool call: function missing or not an object", nil
 	}
 
 	name, _ := fn["name"].(string)
@@ -391,19 +658,19 @@ func handleToolCall(ctx context.Context, i int, tci any) (string, string) {
 	args := map[string]any{}
 	if err := json.Unmarshal([]byte(argStr), &args); err != nil {
 		// Report bad arguments back to the model.
-		return callID, fmt.Sprintf("invalid tool arguments: %v", err)
+		return callID, fmt.Sprintf("invalid tool arguments: %v", err), nil
 	}
 
 	tool, ok := toolRegistry[name]
 	if !ok {
-		return callID, "unknown tool"
+		return callID, "unknown tool", nil
 	}
 
-	out, err := tool.Handler(ctx, args)
+	result, err := tool.Handler(ctx, args)
 	if err != nil {
-		return callID, err.Error()
+		return callID, err.Error(), err
 	}
-	return callID, out
+	return callID, result, nil
 }
 
 func InvokeIntelligence(ctx context.Context, username, message, url, model, apiKey string) (string, error) {
@@ -412,8 +679,6 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 
 	addMessage := func(msg map[string]any) {
 		messages = append(messages, msg)
-		b, _ := json.MarshalIndent(msg, "", "  ")
-		fmt.Fprintln(os.Stderr, string(b))
 	}
 
 	addMessage(map[string]any{
@@ -441,62 +706,80 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			"messages":    messages,
 			"tools":       tools,
 			"tool_choice": "auto",
+			"provider": map[string]any{
+				"order":           []string{"DeepSeek"},
+				"allow_fallbacks": true,
+			},
 		}
 
-		j, err := json.Marshal(reqBody)
+		// Stream the assistant reply: prefix markers delineate reasoning
+		// tokens from output tokens.
+		var streamedReasoning, streamedOutput bool
+		var content []string
+
+		res, err := llmCallStream(ctx, url, apiKey, reqBody,
+			func(s string) {
+				if !streamedReasoning {
+					fmt.Fprint(os.Stdout, "[reasoning] ")
+					streamedReasoning = true
+				}
+				fmt.Fprint(os.Stdout, s)
+			},
+			func(s string) {
+				if !streamedOutput {
+					fmt.Fprintln(os.Stdout, "")
+					fmt.Fprint(os.Stdout, "[output] ")
+					streamedOutput = true
+				}
+				fmt.Fprint(os.Stdout, s)
+				content = append(content, s)
+			},
+		)
 		if err != nil {
 			return "", err
 		}
-
-		status, body, err := llmCall(ctx, url, apiKey, j)
-		if err != nil {
-			return "", err
-		}
-
-		// Surface upstream failures with their status and body.
-		if status != http.StatusOK {
-			return "", fmt.Errorf("upstream %d: %s", status,
-				truncateUTF8(strings.TrimSpace(string(body)), 1024, " ...[truncated]"))
-		}
-
-		var result map[string]any
-		if err := json.Unmarshal(body, &result); err != nil {
-			return "", fmt.Errorf("invalid JSON from upstream: %w", err)
-		}
-		if msg := extractUpstreamError(result); msg != "" {
-			return "", fmt.Errorf("upstream error: %s", msg)
-		}
-
-		// Malformed responses error out rather than panic.
-		choices, ok := result["choices"].([]any)
-		if !ok || len(choices) == 0 {
-			return "", fmt.Errorf("invalid or empty choices in response")
-		}
-		first, ok := choices[0].(map[string]any)
-		if !ok {
-			return "", fmt.Errorf("malformed choice entry in response")
-		}
-		msg, ok := first["message"].(map[string]any)
-		if !ok {
-			return "", fmt.Errorf("response choice has no message object")
-		}
+		msg := res.assistant
 
 		addMessage(msg)
 
-		// No (or malformed) tool_calls: the message content is the final answer.
-		toolCalls, ok := msg["tool_calls"].([]any)
-		if !ok || len(toolCalls) == 0 {
-			if content, ok := msg["content"].(string); ok {
-				return content, nil
+		// No (or malformed) tool_calls: the streamed content is the answer.
+		toolCalls, _ := msg["tool_calls"].([]any)
+		if len(toolCalls) == 0 {
+			if len(content) == 0 {
+				fmt.Fprintf(os.Stderr,
+					"[llm] stream ended with no content and no tool calls (finish_reason: %q)\n",
+					res.finishReason)
+				return "", fmt.Errorf("empty assistant reply (no content, no tool calls; finish_reason: %q)",
+					res.finishReason)
 			}
-
-			return "", fmt.Errorf("no tool calls and failed to parse msg['content']")
+			return strings.Join(content, ""), nil
 		}
 
 		// process tool calls
 		for n, tci := range toolCalls {
-			callID, toolResult := handleToolCall(ctx, n, tci)
+			callID, toolResult, callErr := handleToolCall(ctx, n, tci)
 			toolResult = truncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
+
+			name := ""
+			argStr := ""
+			if tciMap, ok := tci.(map[string]any); ok {
+				if fn, ok := tciMap["function"].(map[string]any); ok {
+					name, _ = fn["name"].(string)
+					argStr, _ = fn["arguments"].(string)
+				}
+			}
+			argOneLine := strings.ReplaceAll(argStr, "\n", " ")
+			argOneLine = truncateUTF8(argOneLine, 128, " ...")
+
+			fmt.Fprintln(os.Stdout, "")
+			fmt.Fprintf(os.Stdout, "[tool: %s] %s\n", name, argOneLine)
+			if callErr != nil {
+				fmt.Fprintf(os.Stdout, "[tool: %s] error: %s", name,
+					truncateUTF8(toolResult, 512, " ..."))
+			} else {
+				fmt.Fprintf(os.Stdout, "[tool: %s] ok: %s", name,
+					truncateUTF8(toolResult, 128, " ..."))
+			}
 
 			addMessage(map[string]any{
 				"role":         "tool",
@@ -529,12 +812,12 @@ func main() {
 	model := "deepseek/deepseek-v4-flash-0731"
 
 	//out, err := InvokeIntelligence(ctx, "alice", "How old is Josipa Lisac?", url, model, apiKey)
-	out, err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
+	_, err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
 	//out, err := InvokeIntelligence(ctx, "alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return
 	}
 
-	fmt.Println(out)
+	fmt.Println()
 }
