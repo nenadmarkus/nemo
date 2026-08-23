@@ -184,7 +184,8 @@ proc httpRequest*(ctx: RunContext, meth, urlStr, body: string,
   for h in headers:
     httpHeaders[h.name] = h.value
 
-  result = client.request(urlStr, meth, body, httpHeaders)
+  let methodEnum = parseEnum[HttpMethod](meth, HttpGet)
+  result = client.request(urlStr, methodEnum, body, httpHeaders)
 
 # tool defs -------------------------------------------------------------------
 

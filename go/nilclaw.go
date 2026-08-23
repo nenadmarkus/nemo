@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -61,8 +60,6 @@ const (
 	llmTimeout = 32 * time.Second
 	// fetchTimeout caps one tool fetch.
 	fetchTimeout = 15 * time.Second
-	// dialTimeout caps TCP connection establishment.
-	dialTimeout = 10 * time.Second
 	// runTimeout bounds the entire run, so a wedged run cannot hang forever.
 	runTimeout = 10 * time.Minute
 
@@ -132,8 +129,7 @@ var toolRegistry = map[string]Tool{
 				return "", fmt.Errorf("url is required")
 			}
 
-			// http/https only; the address itself is enforced at dial time
-			// by guardedDialContext, which covers redirect hops too.
+			// http/https only.
 			u, err := url.Parse(urlStr)
 			if err != nil {
 				return "", fmt.Errorf("invalid url: %w", err)
@@ -219,66 +215,7 @@ func buildToolSpecs() []map[string]interface{} {
 	return tools
 }
 
-// Outbound request policy: SSRF guard, redirect rules, shared client.
-
-var guardedDialer = &net.Dialer{
-	Timeout:   dialTimeout,
-	KeepAlive: 30 * time.Second,
-}
-
-// guardedDialContext is the SSRF gate for every outbound connection: it
-// resolves the host, refuses non-public addresses, and dials a validated
-// IP directly, so neither redirects nor DNS rebinding can reach internal
-// endpoints. Behind an explicit HTTP(S)_PROXY only the proxy itself is
-// dialed by us.
-func guardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-
-	dialAddrs := make([]string, 0, len(ips))
-	for _, ipa := range ips {
-		if ipa.Zone != "" || !isPublicIP(ipa.IP) {
-			return nil, fmt.Errorf("blocked non-public address %s for %q", ipa.IP, host)
-		}
-		dialAddrs = append(dialAddrs, net.JoinHostPort(ipa.IP.String(), port))
-	}
-	if len(dialAddrs) == 0 {
-		return nil, fmt.Errorf("host %q did not resolve to any address", host)
-	}
-
-	// Dial a validated IP; TLS still uses the URL hostname for SNI and
-	// certificate verification.
-	var lastErr error
-	for _, da := range dialAddrs {
-		conn, err := guardedDialer.DialContext(ctx, network, da)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-	}
-	return nil, lastErr
-}
-
-// isPublicIP reports whether ip is globally routable; loopback, private,
-// link-local, multicast, unspecified, broadcast and CGNAT space are not.
-func isPublicIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
-		ip.Equal(net.IPv4bcast) {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-		return false // 100.64.0.0/10 carrier-grade NAT
-	}
-	return true
-}
+// Outbound request policy: redirect rules and shared client.
 
 // checkRedirect applies the outbound policy to every redirect hop:
 // http/https only, bounded chain length. (Go itself strips Authorization
@@ -293,19 +230,8 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// httpClient is shared by all outbound traffic (LLM calls and fetches);
-// every request, initial or redirected, passes the dial guard and the
-// redirect policy. Per-request deadlines come from the caller's context.
+// httpClient is shared by all outbound traffic (LLM calls and fetches).
 var httpClient = &http.Client{
-	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           guardedDialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	},
 	CheckRedirect: checkRedirect,
 }
 
