@@ -797,25 +797,53 @@ func main() {
 
 	model := "deepseek/deepseek-v4-flash-0731"
 
-	// Stream callbacks: render reasoning/output tokens to stdout with one-time
-	// header lines, and system/status diagnostics to stderr with an [llm]
-	// header.
-	var streamedReasoning, streamedOutput bool
+	// Stream callbacks: render reasoning/output/tool blocks to stdout, each
+	// starting on a fresh line with its own header so phases are unmistakable.
+	// System/status diagnostics go to stderr with an [llm] header.
+	const (
+		blockNone      = 0
+		blockReasoning = 1
+		blockOutput    = 2
+		blockTool      = 3
+	)
+	currentBlock := blockNone
+	printedAny := false
+	lineOpen := false
+
+	// emit appends to the current line (tracking whether it ends with a
+	// newline); emitLine writes a complete line.
+	emit := func(s string) {
+		fmt.Fprint(os.Stdout, s)
+		lineOpen = !strings.HasSuffix(s, "\n")
+	}
+	emitLine := func(s string) {
+		fmt.Fprintln(os.Stdout, s)
+		lineOpen = true
+	}
+
+	beginBlock := func(kind int, header string) {
+		if currentBlock == kind {
+			return
+		}
+		if lineOpen {
+			emitLine("")
+		}
+		if printedAny {
+			emitLine("")
+		}
+		emitLine(header)
+		printedAny = true
+		currentBlock = kind
+	}
 
 	onReasoning := func(s string) {
-		if !streamedReasoning {
-			fmt.Fprintln(os.Stdout, "[reasoning]")
-			streamedReasoning = true
-		}
-		fmt.Fprint(os.Stdout, s)
+		beginBlock(blockReasoning, "[reasoning]")
+		emit(s)
 	}
 
 	onContent := func(s string) {
-		if !streamedOutput {
-			fmt.Fprintln(os.Stdout, "[output]")
-			streamedOutput = true
-		}
-		fmt.Fprint(os.Stdout, s)
+		beginBlock(blockOutput, "[output]")
+		emit(s)
 	}
 
 	onSystem := func(s string) {
@@ -827,16 +855,18 @@ func main() {
 		if callID != "" {
 			label = callID + " " + name
 		}
+		beginBlock(blockTool, "[tool: "+label+"]")
 		argOneLine := strings.ReplaceAll(args, "\n", " ")
-		fmt.Fprintln(os.Stdout, "")
-		fmt.Fprintf(os.Stdout, "[tool: %s]\n%s\n", label, truncateUTF8(argOneLine, 128, " ..."))
+		emitLine(truncateUTF8(argOneLine, 128, " ..."))
 		if ok {
-			fmt.Fprintf(os.Stdout, "[tool: %s] ok:\n%s", label,
-				truncateUTF8(detail, 128, " ..."))
+			emit("ok:\n")
+			emit(truncateUTF8(detail, 128, " ..."))
 		} else {
-			fmt.Fprintf(os.Stdout, "[tool: %s] error:\n%s", label,
-				truncateUTF8(detail, 512, " ..."))
+			emit("error:\n")
+			emit(truncateUTF8(detail, 512, " ..."))
 		}
+		// Each tool call is its own block; the next phase starts fresh.
+		currentBlock = blockNone
 	}
 
 	//out, err := InvokeIntelligence(ctx, "alice", "How old is Josipa Lisac?", url, model, apiKey)
