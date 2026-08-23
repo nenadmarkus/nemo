@@ -797,37 +797,37 @@ func main() {
 
 	model := "deepseek/deepseek-v4-flash-0731"
 
-	// Stream callbacks: render reasoning/output/tool blocks to stdout, each
+	// Stream callbacks: render reasoning/output/tool/system blocks, each
 	// starting on a fresh line with its own header so phases are unmistakable.
-	// System/status diagnostics go to stderr with an [llm] header.
 	const (
 		blockNone      = 0
 		blockReasoning = 1
 		blockOutput    = 2
 		blockTool      = 3
+		blockSystem    = 4
 	)
 	currentBlock := blockNone
 	printedAny := false
 	lineOpen := false
 
-	// emit appends to the current line (tracking whether it ends with a
-	// newline); emitLine writes a complete line.
-	emit := func(s string) {
-		fmt.Fprint(os.Stdout, s)
-		lineOpen = !strings.HasSuffix(s, "\n")
-	}
+	// stdout primitives; lineOpen tracks whether the last stdout write ended
+	// with a newline.
 	emitLine := func(s string) {
 		fmt.Fprintln(os.Stdout, s)
 		lineOpen = true
 	}
+	closeLine := func() {
+		if !lineOpen {
+			emitLine("")
+		}
+	}
 
-	beginBlock := func(kind int, header string) {
+	// beginStdout starts a reasoning/output/tool block on stdout.
+	beginStdout := func(kind int, header string) {
 		if currentBlock == kind {
 			return
 		}
-		if lineOpen {
-			emitLine("")
-		}
+		closeLine()
 		if printedAny {
 			emitLine("")
 		}
@@ -837,17 +837,28 @@ func main() {
 	}
 
 	onReasoning := func(s string) {
-		beginBlock(blockReasoning, "[reasoning]")
-		emit(s)
+		beginStdout(blockReasoning, "[reasoning]")
+		fmt.Fprint(os.Stdout, s)
+		lineOpen = false
 	}
 
 	onContent := func(s string) {
-		beginBlock(blockOutput, "[output]")
-		emit(s)
+		beginStdout(blockOutput, "[output]")
+		fmt.Fprint(os.Stdout, s)
+		lineOpen = false
 	}
 
 	onSystem := func(s string) {
-		fmt.Fprintf(os.Stderr, "[llm]\n%s\n", s)
+		if currentBlock != blockSystem {
+			closeLine()
+			if printedAny {
+				fmt.Fprintln(os.Stderr, "")
+			}
+			printedAny = true
+			currentBlock = blockSystem
+		}
+		oneLine := strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
+		fmt.Fprintf(os.Stderr, "[system] %s\n", truncateUTF8(oneLine, 1024, " ..."))
 	}
 
 	onTool := func(callID, name, args string, ok bool, detail string) {
@@ -855,15 +866,15 @@ func main() {
 		if callID != "" {
 			label = callID + " " + name
 		}
-		beginBlock(blockTool, "[tool: "+label+"]")
+		beginStdout(blockTool, "[tool: "+label+"]")
 		argOneLine := strings.ReplaceAll(args, "\n", " ")
 		emitLine(truncateUTF8(argOneLine, 128, " ..."))
 		if ok {
-			emit("ok:\n")
-			emit(truncateUTF8(detail, 128, " ..."))
+			emitLine("ok:")
+			emitLine(truncateUTF8(detail, 128, " ..."))
 		} else {
-			emit("error:\n")
-			emit(truncateUTF8(detail, 512, " ..."))
+			emitLine("error:")
+			emitLine(truncateUTF8(detail, 512, " ..."))
 		}
 		// Each tool call is its own block; the next phase starts fresh.
 		currentBlock = blockNone
