@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -73,6 +74,11 @@ const (
 
 	// maxRedirects bounds redirect chains.
 	maxRedirects = 10
+
+	// maxRetries bounds transient LLM call attempts (network errors, 429/5xx).
+	maxRetries = 3
+	// maxBackoff caps the sleep between LLM retries.
+	maxBackoff = 5 * time.Second
 )
 
 /*
@@ -84,45 +90,45 @@ tool defs
 type Tool struct {
 	Name        string
 	Description string
-	Parameters  map[string]interface{}
-	Handler     func(ctx context.Context, args map[string]interface{}) (string, error)
+	Parameters  map[string]any
+	Handler     func(ctx context.Context, args map[string]any) (string, error)
 }
 
 var toolRegistry = map[string]Tool{
 	"fetch": {
 		Name:        "fetch",
 		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
-		Parameters: map[string]interface{}{
+		Parameters: map[string]any{
 			"type": "object",
-			"properties": map[string]interface{}{
-				"url": map[string]interface{}{
+			"properties": map[string]any{
+				"url": map[string]any{
 					"type": "string",
 				},
-				"method": map[string]interface{}{
+				"method": map[string]any{
 					"type":    "string",
 					"default": "GET",
 				},
-				"headers": map[string]interface{}{
+				"headers": map[string]any{
 					"type": "object",
-					"additionalProperties": map[string]interface{}{
+					"additionalProperties": map[string]any{
 						"type": "string",
 					},
 				},
-				"body": map[string]interface{}{
+				"body": map[string]any{
 					"type": "string",
 				},
-				"max_bytes": map[string]interface{}{
+				"max_bytes": map[string]any{
 					"type":        "integer",
 					"description": "maximum response size in bytes (default 2097152)",
 				},
-				"readable": map[string]interface{}{
+				"readable": map[string]any{
 					"type":        "boolean",
 					"description": "light postprocessing to extract readable content by removing script and style tags, etc.",
 				},
 			},
 			"required": []string{"url"},
 		},
-		Handler: func(ctx context.Context, args map[string]interface{}) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 
 			urlStr, ok := args["url"].(string)
 			if !ok || urlStr == "" {
@@ -158,7 +164,7 @@ var toolRegistry = map[string]Tool{
 
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-			if h, ok := args["headers"].(map[string]interface{}); ok {
+			if h, ok := args["headers"].(map[string]any); ok {
 				for k, v := range h {
 					if vs, ok := v.(string); ok {
 						req.Header.Set(k, vs)
@@ -179,7 +185,7 @@ var toolRegistry = map[string]Tool{
 				maxBytes = int64(mb)
 			}
 
-			data, err := io.ReadAll(io.LimitReader(res.Body, maxBytes))
+			data, err := io.ReadAll(io.LimitReader(res.Body, maxBytes+1))
 			if err != nil {
 				return "", err
 			}
@@ -189,22 +195,26 @@ var toolRegistry = map[string]Tool{
 				readable = r
 			}
 
+			out := string(data)
+			if int64(len(data)) > maxBytes {
+				out = truncateUTF8(out, int(maxBytes), "\n...[truncated]")
+			}
 			if readable {
-				return extractText(string(data)), nil
+				out = extractText(out)
 			}
 
-			return string(data), nil
+			return out, nil
 		},
 	},
 }
 
-func buildToolSpecs() []map[string]interface{} {
-	var tools []map[string]interface{}
+func buildToolSpecs() []map[string]any {
+	var tools []map[string]any
 
 	for _, t := range toolRegistry {
-		tools = append(tools, map[string]interface{}{
+		tools = append(tools, map[string]any{
 			"type": "function",
-			"function": map[string]interface{}{
+			"function": map[string]any{
 				"name":        t.Name,
 				"description": t.Description,
 				"parameters":  t.Parameters,
@@ -265,11 +275,11 @@ func truncateUTF8(s string, limit int, marker string) string {
 
 // extractUpstreamError pulls a human-readable message out of an OpenAI-style
 // error body: {"error": "msg"} or {"error": {"message": "msg", ...}}.
-func extractUpstreamError(result map[string]interface{}) string {
+func extractUpstreamError(result map[string]any) string {
 	switch e := result["error"].(type) {
 	case string:
 		return e
-	case map[string]interface{}:
+	case map[string]any:
 		if msg, _ := e["message"].(string); msg != "" {
 			return msg
 		}
@@ -277,24 +287,143 @@ func extractUpstreamError(result map[string]interface{}) string {
 	return ""
 }
 
-func InvokeIntelligence(ctx context.Context, username, message, url, model, apiKey string) (string, error) {
+// sleepCtx sleeps for d, returning early with the context's error if the run
+// is cancelled meanwhile.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
 
-	var messages []map[string]interface{}
+// llmCall sends a JSON payload to the LLM endpoint and returns the status and
+// body. Transient failures (network/read errors, 429 and 5xx) are retried up
+// to maxRetries times with capped exponential backoff, honoring Retry-After
+// when present.
+func llmCall(ctx context.Context, url, apiKey string, payload []byte) (int, []byte, error) {
+	for attempt := 0; ; attempt++ {
+		var resp *http.Response
 
-	addMessage := func(msg map[string]interface{}) {
-		messages = append(messages, msg)
-		b, _ := json.MarshalIndent(msg, "", "  ")
-		fmt.Println(string(b))
+		// Per-attempt deadline within the run context.
+		reqCtx, cancel := context.WithTimeout(ctx, llmTimeout)
+
+		req, err := http.NewRequestWithContext(
+			reqCtx,
+			http.MethodPost,
+			url,
+			bytes.NewReader(payload),
+		)
+		if err != nil {
+			cancel()
+			return 0, nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+
+		var respBody []byte
+		resp, err = httpClient.Do(req)
+		if err == nil {
+			var readErr error
+			respBody, readErr = readCapped(resp.Body, maxLLMResponseBytes)
+			resp.Body.Close() // close immediately after reading, saves memory
+			cancel()
+
+			if readErr != nil {
+				err = readErr
+			} else if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+				return resp.StatusCode, respBody, nil
+			} else {
+				err = fmt.Errorf("upstream %s: %s", resp.Status,
+					truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
+			}
+		} else {
+			cancel()
+		}
+
+		if attempt >= maxRetries || ctx.Err() != nil {
+			return 0, nil, err
+		}
+
+		delay := time.Second << attempt
+		if resp != nil {
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs >= 0 {
+					delay = time.Duration(secs) * time.Second
+				}
+			}
+		}
+		if delay > maxBackoff {
+			delay = maxBackoff
+		}
+		if err := sleepCtx(ctx, delay); err != nil {
+			return 0, nil, err
+		}
+	}
+}
+
+// handleToolCall runs one tool call for the model, returning the call ID
+// (synthesized when missing) and the result text. Malformed entries are
+// reported back to the model instead of being forwarded as an empty message.
+func handleToolCall(ctx context.Context, i int, tci any) (string, string) {
+	call, ok := tci.(map[string]any)
+	if !ok {
+		if raw, err := json.Marshal(tci); err == nil {
+			return "", fmt.Sprintf("invalid tool call: %s", truncateUTF8(string(raw), 512, " ..."))
+		}
+		return "", "invalid tool call: expected an object with id and function"
 	}
 
-	addMessage(map[string]interface{}{
+	callID, _ := call["id"].(string)
+	if callID == "" {
+		callID = fmt.Sprintf("call_%d", i)
+	}
+
+	fn, ok := call["function"].(map[string]any)
+	if !ok {
+		return callID, "invalid tool call: function missing or not an object"
+	}
+
+	name, _ := fn["name"].(string)
+	argStr, _ := fn["arguments"].(string)
+
+	args := map[string]any{}
+	if err := json.Unmarshal([]byte(argStr), &args); err != nil {
+		// Report bad arguments back to the model.
+		return callID, fmt.Sprintf("invalid tool arguments: %v", err)
+	}
+
+	tool, ok := toolRegistry[name]
+	if !ok {
+		return callID, "unknown tool"
+	}
+
+	out, err := tool.Handler(ctx, args)
+	if err != nil {
+		return callID, err.Error()
+	}
+	return callID, out
+}
+
+func InvokeIntelligence(ctx context.Context, username, message, url, model, apiKey string) (string, error) {
+
+	var messages []map[string]any
+
+	addMessage := func(msg map[string]any) {
+		messages = append(messages, msg)
+		b, _ := json.MarshalIndent(msg, "", "  ")
+		fmt.Fprintln(os.Stderr, string(b))
+	}
+
+	addMessage(map[string]any{
 		"role": "system",
 		"content": fmt.Sprintf(
 			"You are an assistant. Current time: %s. Use fetch from https://html.duckduckgo.com/html/?q=<query> for web search.",
 			time.Now().Format(time.RFC3339),
 		),
 	})
-	addMessage(map[string]interface{}{
+	addMessage(map[string]any{
 		"role":    "user",
 		"content": fmt.Sprintf("%s: %s", username, message),
 	})
@@ -302,12 +431,12 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 	tools := buildToolSpecs()
 
 	const maxToolIterations = 32
-	for i := 0; i < maxToolIterations; i++ {
+	for range maxToolIterations {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"model":       model,
 			"messages":    messages,
 			"tools":       tools,
@@ -319,43 +448,18 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 			return "", err
 		}
 
-		// Per-call deadline within the run context.
-		reqCtx, cancel := context.WithTimeout(ctx, llmTimeout)
-
-		req, err := http.NewRequestWithContext(
-			reqCtx,
-			http.MethodPost,
-			url,
-			bytes.NewReader(j),
-		)
-		if err != nil {
-			cancel()
-			return "", err
-		}
-
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			cancel()
-			return "", err
-		}
-
-		body, err := readCapped(resp.Body, maxLLMResponseBytes)
-		resp.Body.Close() // close immediately after reading, saves memory
-		cancel()
+		status, body, err := llmCall(ctx, url, apiKey, j)
 		if err != nil {
 			return "", err
 		}
 
 		// Surface upstream failures with their status and body.
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("upstream %s: %s", resp.Status,
+		if status != http.StatusOK {
+			return "", fmt.Errorf("upstream %d: %s", status,
 				truncateUTF8(strings.TrimSpace(string(body)), 1024, " ...[truncated]"))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		if err := json.Unmarshal(body, &result); err != nil {
 			return "", fmt.Errorf("invalid JSON from upstream: %w", err)
 		}
@@ -364,15 +468,15 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 		}
 
 		// Malformed responses error out rather than panic.
-		choices, ok := result["choices"].([]interface{})
+		choices, ok := result["choices"].([]any)
 		if !ok || len(choices) == 0 {
 			return "", fmt.Errorf("invalid or empty choices in response")
 		}
-		first, ok := choices[0].(map[string]interface{})
+		first, ok := choices[0].(map[string]any)
 		if !ok {
 			return "", fmt.Errorf("malformed choice entry in response")
 		}
-		msg, ok := first["message"].(map[string]interface{})
+		msg, ok := first["message"].(map[string]any)
 		if !ok {
 			return "", fmt.Errorf("response choice has no message object")
 		}
@@ -380,7 +484,7 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 		addMessage(msg)
 
 		// No (or malformed) tool_calls: the message content is the final answer.
-		toolCalls, ok := msg["tool_calls"].([]interface{})
+		toolCalls, ok := msg["tool_calls"].([]any)
 		if !ok || len(toolCalls) == 0 {
 			if content, ok := msg["content"].(string); ok {
 				return content, nil
@@ -390,33 +494,11 @@ func InvokeIntelligence(ctx context.Context, username, message, url, model, apiK
 		}
 
 		// process tool calls
-		for _, tci := range toolCalls {
-
-			call, _ := tci.(map[string]interface{})
-			callID, _ := call["id"].(string)
-			fn, _ := call["function"].(map[string]interface{})
-			name, _ := fn["name"].(string)
-			argStr, _ := fn["arguments"].(string)
-
-			args := map[string]interface{}{}
-			var toolResult string
-			if err := json.Unmarshal([]byte(argStr), &args); err != nil {
-				// Report bad arguments back to the model.
-				toolResult = fmt.Sprintf("invalid tool arguments: %v", err)
-			} else if tool, ok := toolRegistry[name]; ok {
-				out, err := tool.Handler(ctx, args)
-				if err != nil {
-					toolResult = err.Error()
-				} else {
-					toolResult = out
-				}
-			} else {
-				toolResult = "unknown tool"
-			}
-
+		for n, tci := range toolCalls {
+			callID, toolResult := handleToolCall(ctx, n, tci)
 			toolResult = truncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
 
-			addMessage(map[string]interface{}{
+			addMessage(map[string]any{
 				"role":         "tool",
 				"tool_call_id": callID,
 				"content":      toolResult,
@@ -440,7 +522,7 @@ func main() {
 
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
 	if apiKey == "" {
-		fmt.Println("error: OPENROUTER_API_KEY not set")
+		fmt.Fprintln(os.Stderr, "error: OPENROUTER_API_KEY not set")
 		return
 	}
 
@@ -450,7 +532,7 @@ func main() {
 	out, err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey)
 	//out, err := InvokeIntelligence(ctx, "alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
-		fmt.Println("error:", err)
+		fmt.Fprintln(os.Stderr, "error:", err)
 		return
 	}
 
