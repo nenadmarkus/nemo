@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -97,6 +99,28 @@ type Tool struct {
 	Description string
 	Parameters  map[string]any
 	Handler     func(ctx context.Context, args map[string]any) (string, error)
+}
+
+// walkTree walks root (a file or directory), calling fn for each file.
+// Unreadable entries are skipped.
+func walkTree(root string, fn func(path string)) error {
+	info, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		fn(root)
+		return nil
+	}
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries
+		}
+		if !d.IsDir() {
+			fn(p)
+		}
+		return nil
+	})
 }
 
 // defaultTools is the tool set main runs with; InvokeIntelligence itself is
@@ -211,6 +235,262 @@ var defaultTools = []Tool{
 			}
 
 			return out, nil
+		},
+	},
+
+	{
+		Name:        "read",
+		Description: "read a text file; offset is the 1-indexed first line, limit caps the line count",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":   map[string]any{"type": "string"},
+				"offset": map[string]any{"type": "integer", "description": "1-indexed line to start from"},
+				"limit":  map[string]any{"type": "integer", "description": "maximum number of lines to return"},
+			},
+			"required": []string{"path"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			path, _ := args["path"].(string)
+			if path == "" {
+				return "", fmt.Errorf("path is required")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return "", err
+			}
+			if bytes.IndexByte(data, 0) >= 0 {
+				return "", fmt.Errorf("%s: binary file", path)
+			}
+			lines := strings.Split(string(data), "\n")
+			start := 0
+			if o, ok := args["offset"].(float64); ok && int(o) > 1 {
+				start = int(o) - 1
+			}
+			if start >= len(lines) {
+				return "", fmt.Errorf("offset %d beyond end of file (%d lines)", start+1, len(lines))
+			}
+			end := len(lines)
+			if l, ok := args["limit"].(float64); ok && int(l) > 0 && start+int(l) < end {
+				end = start + int(l)
+			}
+			out := strings.Join(lines[start:end], "\n")
+			if end < len(lines) {
+				out += fmt.Sprintf("\n...[%d more lines]", len(lines)-end)
+			}
+			return out, nil
+		},
+	},
+
+	{
+		Name:        "write",
+		Description: "write content to a file, creating or overwriting it (makes parent directories)",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":    map[string]any{"type": "string"},
+				"content": map[string]any{"type": "string"},
+			},
+			"required": []string{"path", "content"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			path, _ := args["path"].(string)
+			content, _ := args["content"].(string)
+			if path == "" {
+				return "", fmt.Errorf("path is required")
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return "", err
+			}
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("wrote %d bytes to %s", len(content), path), nil
+		},
+	},
+
+	{
+		Name:        "edit",
+		Description: "replace text in a file; old_text must occur exactly once",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":     map[string]any{"type": "string"},
+				"old_text": map[string]any{"type": "string"},
+				"new_text": map[string]any{"type": "string"},
+			},
+			"required": []string{"path", "old_text", "new_text"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			path, _ := args["path"].(string)
+			oldText, _ := args["old_text"].(string)
+			newText, _ := args["new_text"].(string)
+			if path == "" || oldText == "" {
+				return "", fmt.Errorf("path and old_text are required")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return "", err
+			}
+			n := strings.Count(string(data), oldText)
+			if n == 0 {
+				return "", fmt.Errorf("old_text not found in %s", path)
+			}
+			if n > 1 {
+				return "", fmt.Errorf("old_text matches %d locations in %s; make it unique", n, path)
+			}
+			out := strings.Replace(string(data), oldText, newText, 1)
+			if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+				return "", err
+			}
+			return "ok", nil
+		},
+	},
+
+	{
+		Name:        "grep",
+		Description: "search file contents for a regex; returns matching lines as path:line: text",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern":     map[string]any{"type": "string"},
+				"path":        map[string]any{"type": "string", "description": "file or directory (default .)"},
+				"ignore_case": map[string]any{"type": "boolean"},
+			},
+			"required": []string{"pattern"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			pattern, _ := args["pattern"].(string)
+			if pattern == "" {
+				return "", fmt.Errorf("pattern is required")
+			}
+			if ic, ok := args["ignore_case"].(bool); ok && ic {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return "", fmt.Errorf("invalid pattern: %w", err)
+			}
+			root := "."
+			if p, ok := args["path"].(string); ok && p != "" {
+				root = p
+			}
+			var out []string
+			err = walkTree(root, func(path string) {
+				if len(out) >= 100 {
+					return
+				}
+				f, err := os.Open(path)
+				if err != nil {
+					return
+				}
+				defer f.Close()
+				sc := bufio.NewScanner(f)
+				for i := 1; sc.Scan(); i++ {
+					if re.MatchString(sc.Text()) {
+						out = append(out, fmt.Sprintf("%s:%d: %s", path, i, truncateUTF8(sc.Text(), 500, " ...")))
+						if len(out) >= 100 {
+							out = append(out, "...[truncated at 100 matches]")
+							break
+						}
+					}
+				}
+			})
+			if err != nil {
+				return "", err
+			}
+			if len(out) == 0 {
+				return "no matches", nil
+			}
+			return strings.Join(out, "\n"), nil
+		},
+	},
+
+	{
+		Name:        "find",
+		Description: "find files whose name or path matches a glob pattern (e.g. *.go, **/*_test.go)",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern": map[string]any{"type": "string"},
+				"path":    map[string]any{"type": "string", "description": "directory to search (default .)"},
+			},
+			"required": []string{"pattern"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			pattern, _ := args["pattern"].(string)
+			if pattern == "" {
+				return "", fmt.Errorf("pattern is required")
+			}
+			root := "."
+			if p, ok := args["path"].(string); ok && p != "" {
+				root = p
+			}
+			trim := strings.TrimPrefix(pattern, "**/")
+			match := func(pat, name string) bool {
+				ok, err := filepath.Match(pat, name)
+				return err == nil && ok
+			}
+			var out []string
+			err := walkTree(root, func(p string) {
+				if len(out) >= 1000 {
+					return
+				}
+				rel, err := filepath.Rel(root, p)
+				if err != nil {
+					return
+				}
+				rel = filepath.ToSlash(rel)
+				base := filepath.Base(p)
+				if match(pattern, base) || match(pattern, rel) ||
+					match(trim, base) || match(trim, rel) {
+					out = append(out, rel)
+				}
+			})
+			if err != nil {
+				return "", err
+			}
+			if len(out) == 0 {
+				return "no matches", nil
+			}
+			if len(out) >= 1000 {
+				out = append(out, "...[truncated at 1000 results]")
+			}
+			return strings.Join(out, "\n"), nil
+		},
+	},
+
+	{
+		Name:        "ls",
+		Description: "list directory entries (directories get a trailing /)",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "directory (default .)"},
+			},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			root := "."
+			if p, ok := args["path"].(string); ok && p != "" {
+				root = p
+			}
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				return "", err
+			}
+			var out []string
+			for _, e := range entries {
+				name := e.Name()
+				if e.IsDir() {
+					name += "/"
+				}
+				out = append(out, name)
+				if len(out) >= 500 {
+					out = append(out, "...[truncated at 500 entries]")
+					break
+				}
+			}
+			return strings.Join(out, "\n"), nil
 		},
 	},
 }
