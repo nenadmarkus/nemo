@@ -99,8 +99,10 @@ type Tool struct {
 	Handler     func(ctx context.Context, args map[string]any) (string, error)
 }
 
-var toolRegistry = map[string]Tool{
-	"fetch": {
+// defaultTools is the tool set main runs with; InvokeIntelligence itself is
+// tool-agnostic and takes its tools as an argument.
+var defaultTools = []Tool{
+	{
 		Name:        "fetch",
 		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
 		Parameters: map[string]any{
@@ -213,11 +215,13 @@ var toolRegistry = map[string]Tool{
 	},
 }
 
-func buildToolSpecs() []map[string]any {
-	var tools []map[string]any
+// buildToolSpecs renders tools as OpenAI-style function specs, preserving
+// the caller's order.
+func buildToolSpecs(tools []Tool) []map[string]any {
+	specs := make([]map[string]any, 0, len(tools))
 
-	for _, t := range toolRegistry {
-		tools = append(tools, map[string]any{
+	for _, t := range tools {
+		specs = append(specs, map[string]any{
 			"type": "function",
 			"function": map[string]any{
 				"name":        t.Name,
@@ -227,7 +231,7 @@ func buildToolSpecs() []map[string]any {
 		})
 	}
 
-	return tools
+	return specs
 }
 
 // Outbound request policy: redirect rules and shared client.
@@ -644,7 +648,7 @@ func llmCallStream(
 // (synthesized when missing), the result text, and an error when the call
 // itself failed. Malformed entries are reported back to the model instead of
 // being forwarded as an empty message.
-func handleToolCall(ctx context.Context, i int, tci any) (callID string, out string, callErr error) {
+func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci any) (callID string, out string, callErr error) {
 	call, ok := tci.(map[string]any)
 	if !ok {
 		if raw, err := json.Marshal(tci); err == nil {
@@ -672,7 +676,7 @@ func handleToolCall(ctx context.Context, i int, tci any) (callID string, out str
 		return callID, fmt.Sprintf("invalid tool arguments: %v", err), nil
 	}
 
-	tool, ok := toolRegistry[name]
+	tool, ok := registry[name]
 	if !ok {
 		return callID, "unknown tool", nil
 	}
@@ -686,6 +690,7 @@ func handleToolCall(ctx context.Context, i int, tci any) (callID string, out str
 
 func InvokeIntelligence(
 	ctx context.Context,
+	tools []Tool,
 	username, message, url, model, apiKey string,
 	onReasoning, onContent, onSystem func(string),
 	onTool func(callID, name, args string, ok bool, detail string),
@@ -710,7 +715,13 @@ func InvokeIntelligence(
 		"content": fmt.Sprintf("%s: %s", username, message),
 	})
 
-	tools := buildToolSpecs()
+	// Index the tools by name for dispatch; the specs sent upstream keep
+	// the caller's order.
+	registry := make(map[string]Tool, len(tools))
+	for _, t := range tools {
+		registry[t.Name] = t
+	}
+	specs := buildToolSpecs(tools)
 
 	const maxToolIterations = 32
 	for range maxToolIterations {
@@ -721,7 +732,7 @@ func InvokeIntelligence(
 		reqBody := map[string]any{
 			"model":       model,
 			"messages":    messages,
-			"tools":       tools,
+			"tools":       specs,
 			"tool_choice": "auto",
 			"provider": map[string]any{
 				"order":           []string{"DeepSeek"},
@@ -754,7 +765,7 @@ func InvokeIntelligence(
 
 		// process tool calls
 		for n, tci := range toolCalls {
-			callID, toolResult, callErr := handleToolCall(ctx, n, tci)
+			callID, toolResult, callErr := handleToolCall(ctx, registry, n, tci)
 
 			if onTool != nil {
 				name := ""
@@ -884,7 +895,7 @@ func main() {
 	}
 
 	//out, err := InvokeIntelligence(ctx, "alice", "How old is Josipa Lisac?", url, model, apiKey)
-	err := InvokeIntelligence(ctx, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey,
+	err := InvokeIntelligence(ctx, defaultTools, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey,
 		onReasoning, onContent, onSystem, onTool)
 	//out, err := InvokeIntelligence(ctx, "alice", "What time is it in Croatia?", url, model, apiKey)
 	if err != nil {
