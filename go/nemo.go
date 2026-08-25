@@ -464,10 +464,12 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 		}
 
 		if fr, ok := first["finish_reason"].(string); ok && fr != "" {
-			finishReason = fr
-			if onSystem != nil {
+			// Some upstreams repeat finish_reason on several trailing
+			// chunks (last delta + final empty chunk); announce it once.
+			if finishReason == "" && onSystem != nil {
 				onSystem("finish_reason: " + fr)
 			}
+			finishReason = fr
 		}
 
 		// Standard streaming shape is delta.tool_calls / delta.content; some
