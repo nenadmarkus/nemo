@@ -92,6 +92,15 @@ const (
 tool defs
 */
 
+// systemPrompt is nemo's standing instruction to the model.
+const systemPrompt = "You are an expert coding assistant operating inside `nemo`, a coding agent harness. " +
+	"You help users by reading files, executing commands, editing code, and writing new files.\n\n" +
+	"Guidelines:\n" +
+	"* be minimal and brief\n" +
+	"* show file paths clearly when working with files\n" +
+	"* be mindful with destructive and irreversible actions\n" +
+	"* ask the user to clarify intent if there is uncertainty"
+
 // Tool is a function the model may call; ctx carries the run's deadline
 // and cancellation.
 type Tool struct {
@@ -123,8 +132,8 @@ func walkTree(root string, fn func(path string)) error {
 	})
 }
 
-// defaultTools is the tool set main runs with; InvokeIntelligence itself is
-// tool-agnostic and takes its tools as an argument.
+// defaultTools is the tool set the root agent runs with; Agent.Run itself
+// is tool-agnostic and takes its tools via the Agent.
 var defaultTools = []Tool{
 	{
 		Name:        "fetch",
@@ -968,60 +977,85 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 	return callID, result, nil
 }
 
-func InvokeIntelligence(
+// session is one ongoing conversation: the running user/assistant/tool
+// history, so context persists across turns.
+type session struct {
+	messages []map[string]any
+}
+
+func newSession() *session {
+	return &session{}
+}
+
+// Agent is the static configuration of one assistant loop: where to call,
+// with which model, tools and system prompt, and how long the leash is.
+// Sessions hold the dynamic part (history); Run drives an exchange.
+type Agent struct {
+	Name              string         // label for logging, e.g. "root"
+	Endpoint          string         // chat-completions URL
+	APIKey            string
+	Model             string
+	Tools             []Tool
+	Provider          map[string]any // nil = omit from the request
+	MaxToolIterations int            // 0 = default
+	SystemPrompt      string
+}
+
+// Run appends the user's message to the session, streams the assistant reply
+// through the callbacks while running the tool-use loop, and leaves the full
+// exchange in the history. It returns nil once the assistant answers with
+// plain content. On an empty session the agent's system prompt is seeded, so
+// the first agent to run on a session defines its standing instructions.
+func (ag *Agent) Run(
 	ctx context.Context,
-	tools []Tool,
-	username, message, url, model, apiKey string,
+	s *session,
+	message string,
 	onReasoning, onContent, onSystem func(string),
 	onTool func(callID, name, args string, ok bool, detail string),
 ) error {
 
-	var messages []map[string]any
-
 	addMessage := func(msg map[string]any) {
-		messages = append(messages, msg)
+		s.messages = append(s.messages, msg)
 	}
 
-	addMessage(map[string]any{
-		"role": "system",
-		"content": fmt.Sprintf(
-			"You are an assistant. Current time: %s. Use fetch from https://html.duckduckgo.com/html/?q=<query> for web search.",
-			//"You are an assistant. Current time: %s. Use fetch from https://drone.nenadmarkus.com/search?q=<query> for web search.",
-			time.Now().Format(time.RFC3339),
-		),
-	})
+	if len(s.messages) == 0 && ag.SystemPrompt != "" {
+		addMessage(map[string]any{"role": "system", "content": ag.SystemPrompt})
+	}
 	addMessage(map[string]any{
 		"role":    "user",
-		"content": fmt.Sprintf("%s: %s", username, message),
+		"content": message,
 	})
 
 	// Index the tools by name for dispatch; the specs sent upstream keep
 	// the caller's order.
-	registry := make(map[string]Tool, len(tools))
-	for _, t := range tools {
+	registry := make(map[string]Tool, len(ag.Tools))
+	for _, t := range ag.Tools {
 		registry[t.Name] = t
 	}
-	specs := buildToolSpecs(tools)
+	specs := buildToolSpecs(ag.Tools)
 
-	const maxToolIterations = 32
-	for range maxToolIterations {
+	maxIter := ag.MaxToolIterations
+	if maxIter <= 0 {
+		const defaultMaxToolIterations = 32
+		maxIter = defaultMaxToolIterations
+	}
+	for range maxIter {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
 		reqBody := map[string]any{
-			"model":       model,
-			"messages":    messages,
+			"model":       ag.Model,
+			"messages":    s.messages,
 			"tools":       specs,
 			"tool_choice": "auto",
-			"provider": map[string]any{
-				"order":           []string{"DeepSeek"},
-				"allow_fallbacks": true,
-			},
+		}
+		if ag.Provider != nil {
+			reqBody["provider"] = ag.Provider
 		}
 
 		// Stream the assistant reply through the caller's callbacks.
-		res, err := llmCallStream(ctx, url, apiKey, reqBody, onReasoning, onContent, onSystem)
+		res, err := llmCallStream(ctx, ag.Endpoint, ag.APIKey, reqBody, onReasoning, onContent, onSystem)
 		if err != nil {
 			return err
 		}
@@ -1074,14 +1108,9 @@ func InvokeIntelligence(
 
 func main() {
 
-	// Ctrl-C/SIGTERM cancels the run; runTimeout bounds it.
+	// Ctrl-C/SIGTERM cancels the run; each turn is bounded by runTimeout.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	ctx, cancel := context.WithTimeout(ctx, runTimeout)
-	defer cancel()
-
-	url := "https://openrouter.ai/api/v1/chat/completions"
 
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
 	if apiKey == "" {
@@ -1089,7 +1118,15 @@ func main() {
 		return
 	}
 
-	model := "deepseek/deepseek-v4-flash-0731"
+	root := &Agent{
+		Name:         "root",
+		Endpoint:     "https://openrouter.ai/api/v1/chat/completions",
+		APIKey:       apiKey,
+		Model:        "deepseek/deepseek-v4-flash-0731",
+		Tools:        defaultTools,
+		Provider:     map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true},
+		SystemPrompt: systemPrompt,
+	}
 
 	// Stream callbacks: render reasoning/output/tool/system blocks, each
 	// starting on a fresh line with its own header so phases are unmistakable.
@@ -1174,13 +1211,44 @@ func main() {
 		currentBlock = blockNone
 	}
 
-	//out, err := InvokeIntelligence(ctx, "alice", "How old is Josipa Lisac?", url, model, apiKey)
-	err := InvokeIntelligence(ctx, defaultTools, "alice", "What will the weather be tomorrow around Krapina, Croatia?", url, model, apiKey,
-		onReasoning, onContent, onSystem, onTool)
-	//out, err := InvokeIntelligence(ctx, "alice", "What time is it in Croatia?", url, model, apiKey)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return
+	s := newSession()
+
+	fmt.Println("nemo: turn-based coding assistant (exit or Ctrl-D to quit)")
+
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for {
+		fmt.Print("\n> ")
+		if !sc.Scan() {
+			break
+		}
+		input := strings.TrimSpace(sc.Text())
+		if input == "" {
+			continue
+		}
+		if input == "exit" || input == "quit" {
+			return
+		}
+
+		turnCtx, cancel := context.WithTimeout(ctx, runTimeout)
+		before := len(s.messages)
+		err := root.Run(turnCtx, s, input,
+			onReasoning, onContent, onSystem, onTool)
+		cancel()
+
+		if err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "\ninterrupted")
+				return
+			}
+			fmt.Fprintln(os.Stderr, "error:", err)
+			// Drop a partial exchange (e.g. tool_calls without their
+			// results) so the history stays valid for the next turn.
+			s.messages = s.messages[:before]
+			continue
+		}
+
+		fmt.Println()
 	}
 
 	fmt.Println()
