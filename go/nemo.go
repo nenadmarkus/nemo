@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -132,8 +133,87 @@ type Tool struct {
 	Handler     func(ctx context.Context, args map[string]any) (string, error)
 }
 
-// walkTree walks root (a file or directory), calling fn for each file.
-// Unreadable entries are skipped.
+// gitignoreRule is one parsed .gitignore line.
+type gitignoreRule struct {
+	negate   bool   // !pattern re-includes
+	dirOnly  bool   // trailing slash: matches directories only
+	anchored bool   // pattern is rooted at the walk root
+	pattern  string // slash-separated glob (* and ? do not cross /)
+}
+
+// gitignoreRules is the parsed contents of one .gitignore file. A nil
+// *gitignoreRules ignores nothing, so callers without a .gitignore need
+// no special casing.
+type gitignoreRules struct {
+	rules []gitignoreRule
+}
+
+// parseGitignore parses the subset of .gitignore syntax nemo honors:
+// blank lines and # comments, trailing-slash directory patterns, a slash
+// anywhere in the pattern anchoring it to the ignore file's directory,
+// ! negation (last matching rule wins), and * ? [ ] globs that do not
+// cross "/". Escapes (\# and friends) and ** are not supported.
+func parseGitignore(data string) *gitignoreRules {
+	var g *gitignoreRules
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimRight(line, "\r ")
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		negate := strings.HasPrefix(line, "!")
+		if negate {
+			line = line[1:]
+		}
+		dirOnly := strings.HasSuffix(line, "/")
+		line = strings.TrimSuffix(line, "/")
+		anchored := strings.Contains(line, "/")
+		line = strings.TrimPrefix(line, "/")
+		if line == "" {
+			continue
+		}
+		if g == nil {
+			g = &gitignoreRules{}
+		}
+		g.rules = append(g.rules, gitignoreRule{
+			negate:   negate,
+			dirOnly:  dirOnly,
+			anchored: anchored,
+			pattern:  line,
+		})
+	}
+	return g
+}
+
+// ignored reports whether rel (a path relative to the walk root, in the
+// host's separator form) matches the rules; a nil receiver ignores nothing.
+func (g *gitignoreRules) ignored(rel string, isDir bool) bool {
+	if g == nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	base := path.Base(rel)
+	ignored := false
+	for _, r := range g.rules {
+		if r.dirOnly && !isDir {
+			continue
+		}
+		var ok bool
+		if r.anchored {
+			ok, _ = path.Match(r.pattern, rel)
+		} else {
+			ok, _ = path.Match(r.pattern, base)
+		}
+		if ok {
+			ignored = !r.negate
+		}
+	}
+	return ignored
+}
+
+// walkTree walks root (a file or directory), calling fn for each file that
+// is not gitignored. Only the .gitignore at the walk root is honored
+// (nested .gitignore files are not), and the .git directory is always
+// skipped — unless it is the root itself. Unreadable entries are skipped.
 func walkTree(root string, fn func(path string)) error {
 	info, err := os.Stat(root)
 	if err != nil {
@@ -143,13 +223,28 @@ func walkTree(root string, fn func(path string)) error {
 		fn(root)
 		return nil
 	}
+	var rules *gitignoreRules
+	if data, err := os.ReadFile(filepath.Join(root, ".gitignore")); err == nil {
+		rules = parseGitignore(string(data))
+	}
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable entries
 		}
-		if !d.IsDir() {
-			fn(p)
+		rel, err := filepath.Rel(root, p)
+		if err != nil || rel == "." {
+			return nil
 		}
+		if d.IsDir() {
+			if d.Name() == ".git" || rules.ignored(rel, true) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if rules.ignored(rel, false) {
+			return nil
+		}
+		fn(p)
 		return nil
 	})
 }
@@ -412,7 +507,7 @@ var defaultTools = []Tool{
 
 	{
 		Name:        "grep",
-		Description: "search file contents for a regex; returns matching lines as path:line: text; binary files are skipped",
+		Description: "search file contents for a regex; returns matching lines as path:line: text; binary files and gitignored paths are skipped",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -481,7 +576,7 @@ var defaultTools = []Tool{
 
 	{
 		Name:        "find",
-		Description: "find files whose name or path matches a glob pattern (e.g. *.go, **/*_test.go)",
+		Description: "find files whose name or path matches a glob pattern (e.g. *.go, **/*_test.go); gitignored paths are skipped",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
