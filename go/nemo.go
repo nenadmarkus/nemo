@@ -872,6 +872,16 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 			}
 		}
 		if hasMsg {
+			// Some providers stream the full message object; accept its
+			// content too so answers are never silently dropped.
+			if c, ok := msgObj["content"].(string); ok && c != "" {
+				handled = true
+				streamed = true
+				if onContent != nil {
+					onContent(c)
+				}
+				content = append(content, c)
+			}
 			if calls, ok := msgObj["tool_calls"].([]any); ok && len(calls) > 0 {
 				handled = true
 				streamed = true
@@ -1058,8 +1068,11 @@ type Agent struct {
 // Run appends the user's message to the session, streams the assistant reply
 // through the callbacks while running the tool-use loop, and leaves the full
 // exchange in the history. It returns nil once the assistant answers with
-// plain content. On an empty session the agent's system prompt is seeded, so
-// the first agent to run on a session defines its standing instructions.
+// plain content. A reply with neither content nor tool calls (a quirk of
+// some reasoning models after a long CoT) is retried once with a nudge
+// before the turn fails. On an empty session the agent's system prompt is
+// seeded, so the first agent to run on a session defines its standing
+// instructions.
 func (ag *Agent) Run(
 	ctx context.Context,
 	s *session,
@@ -1093,6 +1106,11 @@ func (ag *Agent) Run(
 		const defaultMaxToolIterations = 32
 		maxIter = defaultMaxToolIterations
 	}
+	// Empty replies (neither content nor tool calls) are retried once with
+	// a nudge instead of failing the turn; the turn's earlier, valid tool
+	// exchanges are kept.
+	nudges := 0
+	const maxNudges = 1
 	for range maxIter {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1121,6 +1139,21 @@ func (ag *Agent) Run(
 		toolCalls, _ := msg["tool_calls"].([]any)
 		if len(toolCalls) == 0 {
 			if msg["content"] == nil {
+				if nudges < maxNudges {
+					nudges++
+					// Drop the empty assistant message and poke the model;
+					// the nudge stays in history after recovery.
+					s.messages = s.messages[:len(s.messages)-1]
+					if onSystem != nil {
+						onSystem(fmt.Sprintf("empty reply (finish_reason: %q); nudging the model to answer",
+							res.finishReason))
+					}
+					addMessage(map[string]any{
+						"role":    "user",
+						"content": "Your previous reply contained no visible output. Provide your final answer now.",
+					})
+					continue
+				}
 				if onSystem != nil {
 					onSystem(fmt.Sprintf("stream ended with no content and no tool calls (finish_reason: %q)",
 						res.finishReason))
