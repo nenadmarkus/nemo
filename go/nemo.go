@@ -820,12 +820,91 @@ func llmCall(ctx context.Context, url, apiKey string, payload []byte) (int, []by
 	}
 }
 
+// usage is token/cost accounting for one LLM request, following the
+// OpenAI/OpenRouter "usage" object: prompt_tokens / completion_tokens
+// (total = sum), with prompt_tokens_details.cached_tokens counted inside
+// prompt tokens and completion_tokens_details.reasoning_tokens inside
+// completion tokens. OpenRouter adds cost (USD). JSON numbers arrive as
+// float64 and are converted; fields the provider omits stay zero.
+type usage struct {
+	promptTokens     int64
+	completionTokens int64
+	cachedTokens     int64  // subset of promptTokens
+	reasoningTokens  int64  // subset of completionTokens
+	cost             float64
+}
+
+// parseUsage extracts a usage object; a nil map yields the zero value.
+func parseUsage(m map[string]any) usage {
+	var u usage
+	if m == nil {
+		return u
+	}
+	u.promptTokens = numAs(m, "prompt_tokens")
+	u.completionTokens = numAs(m, "completion_tokens")
+	if d, ok := m["prompt_tokens_details"].(map[string]any); ok {
+		u.cachedTokens = numAs(d, "cached_tokens")
+	}
+	if d, ok := m["completion_tokens_details"].(map[string]any); ok {
+		u.reasoningTokens = numAs(d, "reasoning_tokens")
+	}
+	if c, ok := m["cost"].(float64); ok {
+		u.cost = c
+	}
+	return u
+}
+
+// numAs reads a JSON number field as int64.
+func numAs(m map[string]any, key string) int64 {
+	if f, ok := m[key].(float64); ok {
+		return int64(f)
+	}
+	return 0
+}
+
+// add accumulates other into u.
+func (u *usage) add(other usage) {
+	u.promptTokens += other.promptTokens
+	u.completionTokens += other.completionTokens
+	u.cachedTokens += other.cachedTokens
+	u.reasoningTokens += other.reasoningTokens
+	u.cost += other.cost
+}
+
+// delta returns how much u has grown relative to an earlier snapshot.
+func (u usage) delta(base usage) usage {
+	return usage{
+		promptTokens:     u.promptTokens - base.promptTokens,
+		completionTokens: u.completionTokens - base.completionTokens,
+		cachedTokens:     u.cachedTokens - base.cachedTokens,
+		reasoningTokens:  u.reasoningTokens - base.reasoningTokens,
+		cost:             u.cost - base.cost,
+	}
+}
+
+// String renders a compact report; details are included only when present.
+func (u usage) String() string {
+	s := fmt.Sprintf("%d in / %d out", u.promptTokens, u.completionTokens)
+	if u.cachedTokens > 0 {
+		s += fmt.Sprintf(" (%d cached)", u.cachedTokens)
+	}
+	if u.reasoningTokens > 0 {
+		s += fmt.Sprintf(" (%d reasoning)", u.reasoningTokens)
+	}
+	if u.cost > 0 {
+		s += fmt.Sprintf(" $%.5f", u.cost)
+	}
+	return s
+}
+
 // sseResult carries the assembled assistant message plus how the stream ended:
-// whether any token streamed and the last finish_reason seen.
+// whether any token streamed, the last finish_reason seen, and the usage
+// object from the final chunk (zero when the provider sends none).
 type sseResult struct {
 	assistant    map[string]any
 	streamed     bool
 	finishReason string
+	usage        usage
 }
 
 // readSSEStream reads an OpenAI-style SSE response, calling onReasoning and
@@ -843,6 +922,7 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 	var toolCalls []any
 	streamed := false
 	finishReason := ""
+	var streamUsage usage
 
 	addToolCall := func(tc any) {
 		tcm, ok := tc.(map[string]any)
@@ -905,9 +985,15 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 			continue
 		}
 
+		// The final chunk (empty choices) usually carries the usage
+		// object; keep the last one seen.
+		if u, ok := chunk["usage"].(map[string]any); ok {
+			streamUsage = parseUsage(u)
+		}
+
 		choices, ok := chunk["choices"].([]any)
 		if !ok || len(choices) == 0 {
-			// Empty-choices chunk (e.g. the final usage chunk): nothing to do.
+			// Empty-choices chunk (e.g. the final usage chunk): nothing else to do.
 			continue
 		}
 		first, ok := choices[0].(map[string]any)
@@ -1003,7 +1089,7 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 	if len(toolCalls) > 0 {
 		assistant["tool_calls"] = toolCalls
 	}
-	return sseResult{assistant: assistant, streamed: streamed, finishReason: finishReason}, nil
+	return sseResult{assistant: assistant, streamed: streamed, finishReason: finishReason, usage: streamUsage}, nil
 }
 
 // llmCallStream posts a streaming chat request (stream: true) and feeds
@@ -1019,6 +1105,9 @@ func llmCallStream(
 ) (sseResult, error) {
 
 	reqBody["stream"] = true
+	// Ask strict OpenAI-compatible backends to include the usage object in
+	// the stream's final chunk (OpenRouter includes it regardless).
+	reqBody["stream_options"] = map[string]any{"include_usage": true}
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return sseResult{}, err
@@ -1147,9 +1236,11 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 }
 
 // session is one ongoing conversation: the running user/assistant/tool
-// history, so context persists across turns.
+// history, so context persists across turns, plus cumulative token/cost
+// accounting as reported by the provider.
 type session struct {
 	messages []map[string]any
+	usage    usage
 }
 
 func newSession() *session {
@@ -1236,6 +1327,7 @@ func (ag *Agent) Run(
 		if err != nil {
 			return err
 		}
+		s.usage.add(res.usage)
 		msg := res.assistant
 
 		addMessage(msg)
@@ -1455,6 +1547,15 @@ func main() {
 		// session or the process.
 		turnCtx, cancel := context.WithTimeout(context.Background(), runTimeout)
 		before := len(s.messages)
+		uBefore := s.usage
+
+		// reportUsage prints the turn's token/cost delta plus session
+		// totals; silent when the provider reports no usage.
+		reportUsage := func() {
+			if turn := s.usage.delta(uBefore); turn.promptTokens > 0 || turn.completionTokens > 0 {
+				fmt.Fprintf(os.Stderr, "[usage] turn: %s | session: %s\n", turn, s.usage)
+			}
+		}
 
 		runDone := make(chan error, 1)
 		go func() {
@@ -1489,12 +1590,14 @@ func main() {
 			} else {
 				fmt.Fprintln(os.Stderr, "error:", err)
 			}
+			reportUsage()
 			continue
 		}
 		if interrupted {
 			// Race: the turn completed before the cancel took effect.
 			fmt.Fprintln(os.Stderr, "\n[turn completed before interrupt; kept]")
 		}
+		reportUsage()
 
 		fmt.Println()
 	}
