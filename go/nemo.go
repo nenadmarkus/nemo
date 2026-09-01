@@ -249,6 +249,143 @@ func walkTree(root string, fn func(path string)) error {
 	})
 }
 
+// displayKey keys the console emitter carried in the run context; write
+// and edit use it to show diffs to the user without echoing them back
+// into the model's context.
+type displayKey struct{}
+
+// withDisplay returns a context carrying f as the display emitter.
+func withDisplay(ctx context.Context, f func(string)) context.Context {
+	return context.WithValue(ctx, displayKey{}, f)
+}
+
+// displayFrom returns the display emitter in ctx, or nil when absent.
+func displayFrom(ctx context.Context) func(string) {
+	f, _ := ctx.Value(displayKey{}).(func(string))
+	return f
+}
+
+// diffOp is one rendered diff line: ' ' context, '-' removed, '+' added.
+type diffOp struct {
+	mark byte
+	line string
+}
+
+// lcsOps computes a minimal edit script turning a into b (LCS dynamic
+// programming; callers keep the inputs small).
+func lcsOps(a, b []string) []diffOp {
+	n, m := len(a), len(b)
+	dp := make([][]int, n+1)
+	for i := range dp {
+		dp[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			switch {
+			case a[i] == b[j]:
+				dp[i][j] = dp[i+1][j+1] + 1
+			case dp[i+1][j] >= dp[i][j+1]:
+				dp[i][j] = dp[i+1][j]
+			default:
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+	var ops []diffOp
+	i, j := 0, 0
+	for i < n && j < m {
+		switch {
+		case a[i] == b[j]:
+			ops = append(ops, diffOp{' ', a[i]})
+			i++
+			j++
+		case dp[i+1][j] >= dp[i][j+1]:
+			ops = append(ops, diffOp{'-', a[i]})
+			i++
+		default:
+			ops = append(ops, diffOp{'+', b[j]})
+			j++
+		}
+	}
+	for ; i < n; i++ {
+		ops = append(ops, diffOp{'-', a[i]})
+	}
+	for ; j < m; j++ {
+		ops = append(ops, diffOp{'+', b[j]})
+	}
+	return ops
+}
+
+// diffLines renders a compact human-readable diff of old → nw for the
+// console: the shared prefix/suffix is trimmed, the changed middle is
+// diffed via LCS, and up to three context lines frame each side. Output
+// is capped so a pathological change cannot flood the screen.
+func diffLines(path string, old, nw []string, isNewFile bool) string {
+	const (
+		contextLines = 3   // framing lines on each side
+		maxMiddle    = 300 // LCS input cap per side
+		maxOutput    = 80  // rendered line cap
+	)
+
+	var b strings.Builder
+	if isNewFile {
+		fmt.Fprintf(&b, "[diff: %s] (new file, %d lines)\n", path, len(nw))
+	} else {
+		fmt.Fprintf(&b, "[diff: %s] (%d -> %d lines)\n", path, len(old), len(nw))
+	}
+
+	// Shared prefix, then shared suffix of what remains.
+	p := 0
+	for p < len(old) && p < len(nw) && old[p] == nw[p] {
+		p++
+	}
+	s := 0
+	for s < min(len(old), len(nw))-p {
+		if old[len(old)-1-s] != nw[len(nw)-1-s] {
+			break
+		}
+		s++
+	}
+	aMid := old[p : len(old)-s]
+	bMid := nw[p : len(nw)-s]
+	if len(aMid)+len(bMid) == 0 {
+		b.WriteString("  (unchanged)\n")
+		return b.String()
+	}
+
+	pre := old[max(0, p-contextLines):p]
+	post := old[len(old)-s : min(len(old)-s+contextLines, len(old))]
+
+	var body []diffOp
+	if len(aMid) > maxMiddle || len(bMid) > maxMiddle {
+		for _, l := range pre {
+			body = append(body, diffOp{' ', l})
+		}
+		body = append(body, diffOp{'-', fmt.Sprintf("[...%d lines removed...]", len(aMid))})
+		body = append(body, diffOp{'+', fmt.Sprintf("[...%d lines added...]", len(bMid))})
+		for _, l := range post {
+			body = append(body, diffOp{' ', l})
+		}
+	} else {
+		for _, l := range pre {
+			body = append(body, diffOp{' ', l})
+		}
+		body = append(body, lcsOps(aMid, bMid)...)
+		for _, l := range post {
+			body = append(body, diffOp{' ', l})
+		}
+	}
+
+	for i, op := range body {
+		if i == maxOutput {
+			b.WriteString("[...diff truncated...]\n")
+			break
+		}
+		fmt.Fprintf(&b, "%c %s\n", op.mark, truncateUTF8(op.line, 200, " ..."))
+	}
+	return b.String()
+}
+
 // defaultTools is the tool set the root agent runs with; Agent.Run itself
 // is tool-agnostic and takes its tools via the Agent.
 var defaultTools = []Tool{
@@ -460,6 +597,16 @@ var defaultTools = []Tool{
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				return "", err
 			}
+			// Diff preview against the previous content (if any); shown to
+			// the user only, the tool result stays short.
+			prev, rerr := os.ReadFile(path)
+			if display := displayFrom(ctx); display != nil {
+				var oldLines []string
+				if rerr == nil {
+					oldLines = strings.Split(string(prev), "\n")
+				}
+				display(diffLines(path, oldLines, strings.Split(content, "\n"), rerr != nil))
+			}
 			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 				return "", err
 			}
@@ -498,6 +645,9 @@ var defaultTools = []Tool{
 				return "", fmt.Errorf("old_text matches %d locations in %s; make it unique", n, path)
 			}
 			out := strings.Replace(string(data), oldText, newText, 1)
+			if display := displayFrom(ctx); display != nil {
+				display(diffLines(path, strings.Split(string(data), "\n"), strings.Split(out, "\n"), false))
+			}
 			if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 				return "", err
 			}
@@ -1491,6 +1641,22 @@ func main() {
 		currentBlock = blockNone
 	}
 
+	// onDiff renders a write/edit diff block on stdout.
+	onDiff := func(s string) {
+		closeLine()
+		if printedAny {
+			fmt.Fprintln(os.Stdout, "")
+		}
+		fmt.Fprint(os.Stdout, s)
+		if !strings.HasSuffix(s, "\n") {
+			fmt.Fprintln(os.Stdout, "")
+		}
+		printedAny = true
+		// Each diff is its own block; the next phase starts fresh.
+		currentBlock = blockNone
+		lineOpen = true
+	}
+
 	s := newSession()
 
 	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
@@ -1544,8 +1710,10 @@ func main() {
 
 		// The turn runs on its own context: runTimeout bounds it, and the
 		// select below can cancel it on a signal without touching the
-		// session or the process.
-		turnCtx, cancel := context.WithTimeout(context.Background(), runTimeout)
+		// session or the process. The display emitter rides in the ctx so
+		// write/edit can print diffs without a special result channel.
+		baseCtx := withDisplay(context.Background(), onDiff)
+		turnCtx, cancel := context.WithTimeout(baseCtx, runTimeout)
 		before := len(s.messages)
 		uBefore := s.usage
 
