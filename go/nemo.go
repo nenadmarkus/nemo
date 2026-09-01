@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -79,6 +80,13 @@ const (
 	// maxToolResultBytes caps a tool result fed back into the conversation.
 	maxToolResultBytes = 64 << 10
 
+	// maxReadLines and maxReadBytes cap read output so a huge file cannot
+	// flood the context; maxReadBytes leaves room for the continuation
+	// footer under maxToolResultBytes. (Explicit types: inside a const
+	// block an omitted type would inherit int64 from maxToolResultBytes.)
+	maxReadLines int   = 2000
+	maxReadBytes int64 = 48 << 10
+
 	// maxRedirects bounds redirect chains.
 	maxRedirects = 10
 
@@ -100,6 +108,20 @@ const systemPrompt = "You are an expert coding assistant operating inside `nemo`
 	"* show file paths clearly when working with files\n" +
 	"* be mindful with destructive and irreversible actions\n" +
 	"* ask the user to clarify intent if there is uncertainty"
+
+// groundedPrompt appends workspace facts (cwd, platform, today's date) to
+// the base instructions so the model knows where and when it operates.
+// Computed once per process; a multi-hour session may see a stale date.
+func groundedPrompt(base string) string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = fmt.Sprintf("(unknown: %v)", err)
+	}
+	return base +
+		"\n\nCurrent working directory: " + cwd +
+		"\nPlatform: " + runtime.GOOS + "/" + runtime.GOARCH +
+		"\nDate: " + time.Now().Format("Monday, January 2, 2006")
+}
 
 // Tool is a function the model may call; ctx carries the run's deadline
 // and cancellation.
@@ -249,7 +271,9 @@ var defaultTools = []Tool{
 
 	{
 		Name:        "read",
-		Description: "read a text file; offset is the 1-indexed first line, limit caps the line count",
+		Description: "read a text file; lines are prefixed with 1-indexed line numbers like \"123| text\" " +
+			"(strip that prefix when quoting file text elsewhere, e.g. in edit's old_text); " +
+			"offset is the 1-indexed first line, limit caps the line count",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -271,23 +295,53 @@ var defaultTools = []Tool{
 			if bytes.IndexByte(data, 0) >= 0 {
 				return "", fmt.Errorf("%s: binary file", path)
 			}
+			if len(data) == 0 {
+				return fmt.Sprintf("%s: empty file", path), nil
+			}
 			lines := strings.Split(string(data), "\n")
+			total := len(lines)
+
 			start := 0
 			if o, ok := args["offset"].(float64); ok && int(o) > 1 {
 				start = int(o) - 1
 			}
-			if start >= len(lines) {
-				return "", fmt.Errorf("offset %d beyond end of file (%d lines)", start+1, len(lines))
+			if start >= total {
+				return "", fmt.Errorf("offset %d beyond end of file (%d lines)", start+1, total)
 			}
-			end := len(lines)
-			if l, ok := args["limit"].(float64); ok && int(l) > 0 && start+int(l) < end {
-				end = start + int(l)
+			limit := total - start
+			if l, ok := args["limit"].(float64); ok && int(l) > 0 && int(l) < limit {
+				limit = int(l)
 			}
-			out := strings.Join(lines[start:end], "\n")
-			if end < len(lines) {
-				out += fmt.Sprintf("\n...[%d more lines]", len(lines)-end)
+			if limit > maxReadLines {
+				limit = maxReadLines
 			}
-			return out, nil
+
+			// Numbered output, byte-capped below maxToolResultBytes so the
+			// continuation footer survives intact. At least one line is
+			// always emitted; a pathologically long single line falls
+			// through to Run's hard truncation.
+			width := len(strconv.Itoa(total))
+			var b strings.Builder
+			fmt.Fprintf(&b, "%s: %d lines, %d bytes", path, total, len(data))
+			if start > 0 {
+				fmt.Fprintf(&b, " (from line %d)", start+1)
+			}
+			b.WriteByte('\n')
+
+			last := start // 0-indexed; will hold the last line written
+			for i := start; i < start+limit && i < total; i++ {
+				entry := fmt.Sprintf("%*d| %s\n", width, i+1, lines[i])
+				if i > start && b.Len()+len(entry) > int(maxReadBytes) {
+					break
+				}
+				b.WriteString(entry)
+				last = i
+			}
+			if last+1 < total {
+				fmt.Fprintf(&b, "...[showing lines %d-%d of %d; use offset=%d to continue]\n",
+					start+1, last+1, total, last+2)
+			}
+			return b.String(), nil
 		},
 	},
 
@@ -1121,7 +1175,7 @@ func main() {
 		Model:        "deepseek/deepseek-v4-flash-0731",
 		Tools:        defaultTools,
 		Provider:     map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true},
-		SystemPrompt: systemPrompt,
+		SystemPrompt: groundedPrompt(systemPrompt),
 	}
 
 	// Stream callbacks: render reasoning/output/tool/system blocks, each
