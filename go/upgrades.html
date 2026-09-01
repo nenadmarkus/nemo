@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nemo → pi-like basic agent: upgrade plan</title>
+<style>
+  :root {
+    --text: #1f2328;
+    --muted: #59636e;
+    --border: #d1d9e0;
+    --bg: #ffffff;
+    --bg-soft: #f6f8fa;
+    --accent: #0969da;
+    --p0: #cf222e;
+    --p1: #9a6700;
+    --p2: #59636e;
+    --done: #1a7f37;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    max-width: 60rem;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    line-height: 1.55;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.2rem; margin-top: 2.25rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+  h3 { font-size: 1rem; margin-top: 1.5rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; margin-top: 0.75rem; }
+  th, td { border: 1px solid var(--border); padding: 0.4rem 0.55rem; text-align: left; vertical-align: top; }
+  th { background: var(--bg-soft); position: sticky; top: 0; }
+  tbody tr:nth-child(even) { background: var(--bg-soft); }
+  .prio { font-weight: 600; white-space: nowrap; }
+  .p0 { color: var(--p0); }
+  .p1 { color: var(--p1); }
+  .p2 { color: var(--p2); }
+  .done { color: var(--done); font-weight: 600; white-space: nowrap; }
+  ul { padding-left: 1.4rem; }
+  li { margin: 0.2rem 0; }
+  ol li { margin: 0.45rem 0; }
+  .note { color: var(--muted); font-style: italic; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>nemo → pi-like basic agent: upgrade plan</h1>
+<p class="subtitle">(Excluding a TUI and a bash/exec tool — those are separate work streams.)</p>
+
+<h2>What nemo has today</h2>
+<ul>
+  <li><strong>Agent loop</strong>: OpenAI-compatible streaming client (OpenRouter), tool-call loop (max 32 iterations), session history, system-prompt seeding, history rollback on failed turns</li>
+  <li><strong>Tools</strong>: <code>fetch</code> (with readable-extraction), <code>read</code>, <code>write</code>, <code>edit</code> (unique-match text replace), <code>grep</code>, <code>find</code>, <code>ls</code></li>
+  <li><strong>Robustness</strong>: retries with backoff + Retry-After, per-call/run timeouts, byte caps everywhere, UTF-8-safe truncation, redirect/scheme policy, handles both <code>delta</code> and <code>message</code> stream shapes, <code>reasoning</code>/<code>reasoning_content</code> keys</li>
+  <li><strong>UI</strong>: plain REPL with <code>[reasoning]/[output]/[tool]/[system]</code> block rendering</li>
+</ul>
+<p>The architecture is clean for extension: <code>Tool</code>, <code>Agent</code>, and <code>session</code> are already separated, so everything below bolts on without restructuring.</p>
+
+<h2>The gaps</h2>
+<p>Grouped by theme:</p>
+
+<h3>A. Context &amp; memory</h3>
+<p>This is the biggest hole. History grows unbounded until the provider 400s with “context length exceeded”, and then the user is stuck (the turn is dropped, nothing shrinks). Sessions live only in memory. The <code>usage</code> field in the final SSE chunk is parsed but discarded.</p>
+
+<h3>B. Workspace grounding</h3>
+<p><code>grep</code>/<code>find</code> walk <em>everything</em>: no <code>.gitignore</code> awareness, so the first search in a repo with <code>node_modules/</code> or <code>vendor/</code> drowns in noise. No <code>AGENTS.md</code>-style project instructions. The system prompt is static — no cwd, platform, date. <code>read</code> returns raw text without line numbers or file stats, which makes anchoring edits and navigating big files harder for the model.</p>
+
+<h3>C. Safety &amp; trust</h3>
+<p><code>write</code>/<code>edit</code> execute silently: no approval gate, no diff preview. <code>fetch</code> checks scheme but doesn’t block private IPs/localhost (SSRF if the model fetches attacker-influenced URLs).</p>
+
+<h3>D. Operability</h3>
+<p>Model and endpoint are hardcoded (one env var for the key). Ctrl+C kills the whole process instead of aborting the turn. No one-shot <code>-p</code> mode, no <code>/commands</code>, no transcript on disk.</p>
+
+<h3>E. Robustness polish</h3>
+<p>Empty assistant reply is a hard error (could re-ask once); <code>finish_reason: "length"</code> isn’t treated specially; <code>grep</code> will happily match binary files.</p>
+
+<h2>Table</h2>
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Capability</th>
+      <th>Gap in nemo today</th>
+      <th>Why it matters (pi-parity)</th>
+      <th>Effort</th>
+      <th>Priority</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>Context compaction / trimming</td>
+      <td>None; history grows until upstream 400s</td>
+      <td>Long tasks are impossible without it; pi auto-compacts</td>
+      <td>M</td>
+      <td class="prio p0">P0</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Turn-level interrupt</td>
+      <td>Ctrl-C exits the process</td>
+      <td>pi aborts the turn, keeps the session; achievable in plain REPL (<code>signal.NotifyContext</code> already exists, <code>main</code> just chooses to <code>return</code>)</td>
+      <td>S</td>
+      <td class="prio p0">P0</td>
+      <td class="done">✅ done</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Config &amp; model selection</td>
+      <td>Model/endpoint hardcoded; one env var</td>
+      <td>Model switching, any OpenAI-compatible base URL, temperature/max_tokens</td>
+      <td>S–M</td>
+      <td class="prio p0">P0</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Session persistence &amp; resume</td>
+      <td>In-memory only</td>
+      <td>pi continues past sessions; JSONL on disk is the foundation</td>
+      <td>M</td>
+      <td class="prio p0">P0</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td><code>.gitignore</code>-aware search</td>
+      <td><code>walkTree</code> visits everything</td>
+      <td>Searches in real repos are useless otherwise (vendored dirs); pi respects gitignore</td>
+      <td>S (proper nested gitignores: M)</td>
+      <td class="prio p0">P0</td>
+      <td class="done">✅ done**</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>AGENTS.md project instructions</td>
+      <td>Not loaded</td>
+      <td>pi injects repo conventions into context</td>
+      <td>S</td>
+      <td class="prio p1">P1</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>Grounded system prompt</td>
+      <td>Static text</td>
+      <td>cwd, platform, date → model knows where it operates</td>
+      <td>S</td>
+      <td class="prio p1">P1</td>
+      <td class="done">✅ done</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td><code>read</code> usability</td>
+      <td>Raw text, no line numbers/stats</td>
+      <td>Line numbers + “showing X–Y of N lines” anchors edits and citations</td>
+      <td>S</td>
+      <td class="prio p1">P1</td>
+      <td class="done">✅ done</td>
+    </tr>
+    <tr>
+      <td>9</td>
+      <td>Approval gating for write/edit</td>
+      <td>Auto-executes</td>
+      <td>pi has permission modes; even a y/n prompt in the REPL works pre-TUI</td>
+      <td>M</td>
+      <td class="prio p1">P1</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>10</td>
+      <td>Diff preview for write/edit</td>
+      <td>Silent overwrite</td>
+      <td>User can verify what the model changed</td>
+      <td>S–M</td>
+      <td class="prio p1">P1</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>11</td>
+      <td>Token/cost accounting</td>
+      <td><code>usage</code> chunk discarded</td>
+      <td>pi shows per-turn and session totals; also input for compaction decisions (#1)</td>
+      <td>S</td>
+      <td class="prio p1">P1</td>
+      <td class="done">✅ done</td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td>One-shot mode (<code>-p</code>)</td>
+      <td>Interactive only</td>
+      <td>Scripting/CI usage; trivial since <code>Run</code> is already a clean seam</td>
+      <td>S</td>
+      <td class="prio p1">P1</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td>Slash commands (<code>/model</code>, <code>/clear</code>, <code>/compact</code>, <code>/help</code>)</td>
+      <td>None</td>
+      <td>Cheap control surface without a full TUI</td>
+      <td>S</td>
+      <td class="prio p2">P2</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td>Parallel tool calls</td>
+      <td>Sequential loop</td>
+      <td>Latency win when the model issues independent calls</td>
+      <td>M</td>
+      <td class="prio p2">P2</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>15</td>
+      <td>Image reading (multimodal)</td>
+      <td>Binary rejected outright</td>
+      <td>pi sends images as attachments</td>
+      <td>M</td>
+      <td class="prio p2">P2</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>16</td>
+      <td>JSONL transcript logging</td>
+      <td>None</td>
+      <td>Debugging; also the storage layer for #4</td>
+      <td>S</td>
+      <td class="prio p2">P2</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>17</td>
+      <td>Context-overflow recovery</td>
+      <td>400 → turn dropped, user stuck</td>
+      <td>Auto-compact and retry on “context length exceeded”</td>
+      <td>S (given #1)</td>
+      <td class="prio p2">P2</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>18</td>
+      <td>Empty-reply / <code>finish_reason=length</code> handling</td>
+      <td>Hard error / ignored</td>
+      <td>One re-ask nudge; continuation on truncation</td>
+      <td>S</td>
+      <td class="prio p2">P2</td>
+      <td class="done">✅ done*</td>
+    </tr>
+    <tr>
+      <td>19</td>
+      <td>Fetch SSRF hardening</td>
+      <td>Scheme check only</td>
+      <td>Block private IPs/localhost before dialing</td>
+      <td>S</td>
+      <td class="prio p2">P2</td>
+      <td>—</td>
+    </tr>
+    <tr>
+      <td>20</td>
+      <td>grep binary skip</td>
+      <td>Matches binary junk</td>
+      <td>Noise reduction (NUL-byte sniff, like <code>read</code> does)</td>
+      <td>S</td>
+      <td class="prio p2">P2</td>
+      <td class="done">✅ done</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="note">* #18: empty-reply nudge implemented; <code>finish_reason=length</code> continuation deferred to #17/#3 (needs <code>max_tokens</code> config).<br>
+** #5: root-level <code>.gitignore</code> honored (S); nested <code>.gitignore</code> files and parent-repo ignores deferred (M).</p>
+
+<p><strong>Explicitly out of scope for “basic”</strong> (pi has them, but they’re a later layer): MCP client, extensions, skills, packages, subagents, themes/keybindings (TUI territory).</p>
+
+<h2>Suggested build order</h2>
+<ol>
+  <li><strong>Quick wins</strong>: #2 turn-level interrupt <span class="done">(✅ done)</span>, #3 config/flags, #5 gitignore <span class="done">(✅ done, root-level only)</span></li>
+  <li><strong>Grounding</strong>: #7 <span class="done">(✅ done)</span>, #8 <span class="done">(✅ done)</span>, #6</li>
+  <li><strong>Accounting &amp; storage</strong>: #11 usage tracking <span class="done">(✅ done)</span>, #16 JSONL, then #4 resume on top</li>
+  <li><strong>Compaction</strong>: #1 + #17 — hardest to get right (when to trigger, what to summarize, how to preserve tool-call/result pairing in history)</li>
+  <li><strong>Safety</strong>: #9, #10, #19</li>
+  <li><strong>Ergonomics</strong>: #12, #13, then P2 polish</li>
+</ol>
+
+<h2>Open design questions</h2>
+<ul>
+  <li><strong>Compaction design</strong> — summarize-and-replace (pi-style: condense old turns into a summary message) vs. simple sliding-window trim (drop oldest tool results first, keep user/assistant text)? The former preserves intent, the latter is much simpler and tool results are usually the bulk.</li>
+  <li><strong>Approval UX pre-TUI</strong> — is a plain <code>y/n</code> stdin prompt acceptable for #9, or should that wait for the TUI and land as a <code>--yes</code>/<code>--dry-run</code> flag instead?</li>
+</ul>
+
+</body>
+</html>
