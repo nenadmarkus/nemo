@@ -923,7 +923,7 @@ func llmCallStream(
 		if delay > maxBackoff {
 			delay = maxBackoff
 		}
-		if onSystem != nil {
+		if onSystem != nil && ctx.Err() == nil {
 			onSystem(fmt.Sprintf("attempt %d/%d failed: %v; retrying in %.0fs",
 				attempt+1, maxRetries, err, delay.Seconds()))
 		}
@@ -1108,10 +1108,6 @@ func (ag *Agent) Run(
 
 func main() {
 
-	// Ctrl-C/SIGTERM cancels the run; each turn is bounded by runTimeout.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
 	if apiKey == "" {
 		fmt.Fprintln(os.Stderr, "error: OPENROUTER_API_KEY not set")
@@ -1213,43 +1209,101 @@ func main() {
 
 	s := newSession()
 
-	fmt.Println("nemo: turn-based coding assistant (exit or Ctrl-D to quit)")
+	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
 
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Signals: Ctrl-C/SIGTERM during a run cancels just that turn; at the
+	// prompt it discards the pending line (the tty does that anyway) and a
+	// second consecutive press exits. Default signal disposition is never
+	// relied on, so a stray SIGINT cannot kill the session.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	// stdin is read from a goroutine so the prompt can select on input
+	// and signals at once.
+	lines := make(chan string)
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+
+	idleInterrupts := 0
 	for {
 		fmt.Print("\n> ")
-		if !sc.Scan() {
-			break
+		var input string
+		select {
+		case line, ok := <-lines:
+			if !ok { // EOF (Ctrl-D)
+				fmt.Println()
+				return
+			}
+			input = strings.TrimSpace(line)
+		case <-sigCh:
+			idleInterrupts++
+			if idleInterrupts >= 2 {
+				fmt.Println("\nbye")
+				return
+			}
+			fmt.Fprintln(os.Stderr, "\n(to quit: Ctrl+D or \"exit\"; during a run, Ctrl+C aborts the turn)")
+			continue
 		}
-		input := strings.TrimSpace(sc.Text())
 		if input == "" {
 			continue
 		}
 		if input == "exit" || input == "quit" {
 			return
 		}
+		idleInterrupts = 0
 
-		turnCtx, cancel := context.WithTimeout(ctx, runTimeout)
+		// The turn runs on its own context: runTimeout bounds it, and the
+		// select below can cancel it on a signal without touching the
+		// session or the process.
+		turnCtx, cancel := context.WithTimeout(context.Background(), runTimeout)
 		before := len(s.messages)
-		err := root.Run(turnCtx, s, input,
-			onReasoning, onContent, onSystem, onTool)
+
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- root.Run(turnCtx, s, input,
+				onReasoning, onContent, onSystem, onTool)
+		}()
+
+		var err error
+		interrupted := false
+		select {
+		case err = <-runDone:
+		case <-sigCh:
+			cancel()
+			interrupted = true
+			err = <-runDone // wait for the run to unwind
+			// A second press while unwinding means "really quit".
+			select {
+			case <-sigCh:
+				fmt.Println("\nbye")
+				return
+			default:
+			}
+		}
 		cancel()
 
 		if err != nil {
-			if ctx.Err() != nil {
-				fmt.Fprintln(os.Stderr, "\ninterrupted")
-				return
-			}
-			fmt.Fprintln(os.Stderr, "error:", err)
 			// Drop a partial exchange (e.g. tool_calls without their
 			// results) so the history stays valid for the next turn.
 			s.messages = s.messages[:before]
+			if interrupted {
+				fmt.Fprintln(os.Stderr, "\n[interrupted; turn dropped]")
+			} else {
+				fmt.Fprintln(os.Stderr, "error:", err)
+			}
 			continue
+		}
+		if interrupted {
+			// Race: the turn completed before the cancel took effect.
+			fmt.Fprintln(os.Stderr, "\n[turn completed before interrupt; kept]")
 		}
 
 		fmt.Println()
 	}
-
-	fmt.Println()
 }
