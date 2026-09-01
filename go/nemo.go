@@ -412,7 +412,7 @@ var defaultTools = []Tool{
 
 	{
 		Name:        "grep",
-		Description: "search file contents for a regex; returns matching lines as path:line: text",
+		Description: "search file contents for a regex; returns matching lines as path:line: text; binary files are skipped",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -448,7 +448,17 @@ var defaultTools = []Tool{
 					return
 				}
 				defer f.Close()
-				sc := bufio.NewScanner(f)
+				// Skip binary files: a NUL byte in the first 8KB is the
+				// classic heuristic (read applies the same check to whole
+				// files). Peek does not consume, so the scanner still sees
+				// the sniffed bytes.
+				br := bufio.NewReaderSize(f, 8192)
+				head, _ := br.Peek(8192)
+				if bytes.IndexByte(head, 0) >= 0 {
+					return
+				}
+				sc := bufio.NewScanner(br)
+				sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 				for i := 1; sc.Scan(); i++ {
 					if re.MatchString(sc.Text()) {
 						out = append(out, fmt.Sprintf("%s:%d: %s", path, i, truncateUTF8(sc.Text(), 500, " ...")))
