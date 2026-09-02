@@ -502,7 +502,7 @@ var defaultTools = []Tool{
 	},
 
 	{
-		Name:        "read",
+		Name: "read",
 		Description: "read a text file; lines are prefixed with 1-indexed line numbers like \"123| text\" " +
 			"(strip that prefix when quoting file text elsewhere, e.g. in edit's old_text); " +
 			"offset is the 1-indexed first line, limit caps the line count",
@@ -516,8 +516,8 @@ var defaultTools = []Tool{
 			"required": []string{"path"},
 		},
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			path, _ := args["path"].(string)
-			if path == "" {
+			path, ok := args["path"].(string)
+			if !ok || path == "" {
 				return "", fmt.Errorf("path is required")
 			}
 			data, err := os.ReadFile(path)
@@ -589,10 +589,13 @@ var defaultTools = []Tool{
 			"required": []string{"path", "content"},
 		},
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			path, _ := args["path"].(string)
-			content, _ := args["content"].(string)
-			if path == "" {
+			path, ok := args["path"].(string)
+			if !ok || path == "" {
 				return "", fmt.Errorf("path is required")
+			}
+			content, ok := args["content"].(string)
+			if !ok {
+				return "", fmt.Errorf("content is required")
 			}
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				return "", err
@@ -979,8 +982,8 @@ func llmCall(ctx context.Context, url, apiKey string, payload []byte) (int, []by
 type usage struct {
 	promptTokens     int64
 	completionTokens int64
-	cachedTokens     int64  // subset of promptTokens
-	reasoningTokens  int64  // subset of completionTokens
+	cachedTokens     int64 // subset of promptTokens
+	reasoningTokens  int64 // subset of completionTokens
 	cost             float64
 }
 
@@ -1401,8 +1404,8 @@ func newSession() *session {
 // with which model, tools and system prompt, and how long the leash is.
 // Sessions hold the dynamic part (history); Run drives an exchange.
 type Agent struct {
-	Name              string         // label for logging, e.g. "root"
-	Endpoint          string         // chat-completions URL
+	Name              string // label for logging, e.g. "root"
+	Endpoint          string // chat-completions URL
 	APIKey            string
 	Model             string
 	Tools             []Tool
