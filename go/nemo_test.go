@@ -514,7 +514,7 @@ func TestReadTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := p + ": 3 lines, 14 bytes\n1| one\n2| two\n3| three\n"; out != want {
+	if want := p + ": 3 lines, 13 bytes\n1| one\n2| two\n3| three\n"; out != want {
 		t.Errorf("read = %q, want %q", out, want)
 	}
 
@@ -523,7 +523,7 @@ func TestReadTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := p + ": 3 lines, 14 bytes (from line 2)\n2| two\n" +
+	want := p + ": 3 lines, 13 bytes (from line 2)\n2| two\n" +
 		"...[showing lines 2-2 of 3; use offset=3 to continue]\n"
 	if out != want {
 		t.Errorf("read (offset) = %q, want %q", out, want)
