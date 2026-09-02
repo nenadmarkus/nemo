@@ -88,6 +88,10 @@ const (
 	maxReadLines int   = 2000
 	maxReadBytes int64 = 48 << 10
 
+	// maxAgentsBytes caps the combined AGENTS.md/CLAUDE.md project
+	// instructions injected into the system prompt.
+	maxAgentsBytes int = 32 << 10
+
 	// maxRedirects bounds redirect chains.
 	maxRedirects = 10
 
@@ -116,12 +120,99 @@ const systemPrompt = "You are an expert coding assistant operating inside `nemo`
 func groundedPrompt(base string) string {
 	cwd, err := os.Getwd()
 	if err != nil {
-		cwd = fmt.Sprintf("(unknown: %v)", err)
+	cwd = fmt.Sprintf("(unknown: %v)", err)
 	}
 	return base +
 		"\n\nCurrent working directory: " + cwd +
 		"\nPlatform: " + runtime.GOOS + "/" + runtime.GOARCH +
 		"\nDate: " + time.Now().Format("Monday, January 2, 2006")
+}
+
+// Context files (pi-style project instructions): AGENTS.md (and
+// CLAUDE.md) files found from the working directory upward are injected
+// into the system prompt so repo conventions reach the model.
+
+// contextFileNames are the instruction files a single directory may
+// contribute, in precedence order: AGENTS.override.md replaces AGENTS.md,
+// which beats CLAUDE.md. At most one file per directory is loaded.
+var contextFileNames = []string{"AGENTS.override.md", "AGENTS.md", "CLAUDE.md"}
+
+// contextFileIn returns the one instruction file dir contributes, or "".
+// Entries named like a context file but not regular files (e.g. a
+// directory named AGENTS.md) are ignored.
+func contextFileIn(dir string) string {
+	for _, name := range contextFileNames {
+		p := filepath.Join(dir, name)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// findContextFiles returns the instruction files found in dir and each of
+// its ancestors (up to the filesystem root), outermost first, so files
+// closer to the working directory come later and refine the broader ones
+// above them. Walking up also picks up a user-level AGENTS.md when the
+// working directory lies under $HOME.
+func findContextFiles(dir string) []string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for d := abs; ; d = filepath.Dir(d) {
+		if p := contextFileIn(d); p != "" {
+			files = append(files, p)
+		}
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	// Collected closest-first; reverse so broader (outer) instructions
+	// come first and closer ones layer on top.
+	for i, j := 0, len(files)-1; i < j; i, j = i+1, j-1 {
+		files[i], files[j] = files[j], files[i]
+	}
+	return files
+}
+
+// loadAgentsInstructions reads the context files found from dir upward and
+// returns their combined text: each file labeled with its path, blocks
+// joined by blank lines, outermost first. Blank files are skipped and the
+// total is capped at maxAgentsBytes (UTF-8-safe) so a runaway instruction
+// file cannot crowd out the conversation. Empty when nothing was found.
+// AGENTS.md files in subdirectories of dir are not discovered (only
+// ancestors of dir are walked).
+func loadAgentsInstructions(dir string) string {
+	var blocks []string
+	for _, p := range findContextFiles(dir) {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue // unreadable: skip; the model can still read it via tools
+		}
+		content := strings.TrimSpace(string(data))
+		if content == "" {
+			continue
+		}
+		blocks = append(blocks, fmt.Sprintf("# From %s:\n%s", p, content))
+	}
+	if len(blocks) == 0 {
+		return ""
+	}
+	return truncateUTF8(strings.Join(blocks, "\n\n"), maxAgentsBytes, "\n...[instructions truncated]")
+}
+
+// projectPrompt appends any AGENTS.md/CLAUDE.md project instructions to
+// base so repo conventions ride along in the system prompt; base is
+// returned unchanged when the workspace has no context files.
+func projectPrompt(base, dir string) string {
+	instr := loadAgentsInstructions(dir)
+	if instr == "" {
+		return base
+	}
+	return base + "\n\nProject instructions from AGENTS.md/CLAUDE.md context files " +
+		"(outermost first; when instructions conflict, closer files win):\n\n" + instr
 }
 
 // Tool is a function the model may call; ctx carries the run's deadline
@@ -1624,7 +1715,7 @@ func main() {
 		Model:        "deepseek/deepseek-v4-flash-0731",
 		Tools:        defaultTools,
 		Provider:     map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true},
-		SystemPrompt: groundedPrompt(systemPrompt),
+		SystemPrompt: projectPrompt(groundedPrompt(systemPrompt), "."),
 	}
 
 	// Stream callbacks: render reasoning/output/tool/system blocks, each
