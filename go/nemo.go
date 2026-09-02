@@ -386,6 +386,24 @@ func diffLines(path string, old, nw []string, isNewFile bool) string {
 	return b.String()
 }
 
+// containsCwd reports whether dir is the working directory itself or an
+// ancestor of it — i.e. removing dir would take the workspace with it.
+// filepath.Rel(dir, cwd) names the walk from dir to cwd: it is ".." or
+// starts with "../" only when cwd lies outside dir, so anything else
+// (including "." itself) means cwd is at or inside dir. Fails closed:
+// if the relationship cannot be established, dir is treated as dangerous.
+func containsCwd(dir string) bool {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(dir, cwd)
+	if err != nil {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // defaultTools is the tool set the root agent runs with; Agent.Run itself
 // is tool-agnostic and takes its tools via the Agent.
 var defaultTools = []Tool{
@@ -655,6 +673,54 @@ var defaultTools = []Tool{
 				return "", err
 			}
 			return "ok", nil
+		},
+	},
+
+	{
+		Name:        "delete",
+		Description: "delete a file or directory (irreversible); directories require recursive=true",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":      map[string]any{"type": "string"},
+				"recursive": map[string]any{"type": "boolean", "description": "delete a directory and all of its contents"},
+			},
+			"required": []string{"path"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			path, ok := args["path"].(string)
+			if !ok || path == "" {
+				return "", fmt.Errorf("path is required")
+			}
+			// Lstat (not Stat) so a symlink is deleted as a link, never
+			// followed into its target.
+			info, err := os.Lstat(path)
+			if err != nil {
+				return "", err
+			}
+			recursive, _ := args["recursive"].(bool)
+			if info.IsDir() {
+				if !recursive {
+					return "", fmt.Errorf("%s is a directory; pass recursive=true to delete it and its contents", path)
+				}
+				// Refuse to delete the working directory or any of its
+				// ancestors: an ancestor of cwd contains the workspace.
+				abs, aerr := filepath.Abs(path)
+				if aerr != nil {
+					return "", fmt.Errorf("refusing to delete %s: cannot resolve path: %w", path, aerr)
+				}
+				if containsCwd(abs) {
+					return "", fmt.Errorf("refusing to delete %s: it is the working directory or contains it", path)
+				}
+				if err := os.RemoveAll(path); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("deleted directory %s", path), nil
+			}
+			if err := os.Remove(path); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("deleted %s", path), nil
 		},
 	},
 
