@@ -1,4 +1,4 @@
-package main
+package nemo
 
 import (
 	"context"
@@ -95,7 +95,7 @@ func TestExtractText(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// truncateUTF8.
+// TruncateUTF8.
 // ---------------------------------------------------------------------------
 
 func TestTruncateUTF8(t *testing.T) {
@@ -111,8 +111,8 @@ func TestTruncateUTF8(t *testing.T) {
 		{"日本語", "!", 6, "日本!"},    // cut lands exactly between runes
 	}
 	for _, tt := range tests {
-		if got := truncateUTF8(tt.s, tt.limit, tt.marker); got != tt.want {
-			t.Errorf("truncateUTF8(%q, %d, %q) = %q, want %q",
+		if got := TruncateUTF8(tt.s, tt.limit, tt.marker); got != tt.want {
+			t.Errorf("TruncateUTF8(%q, %d, %q) = %q, want %q",
 				tt.s, tt.limit, tt.marker, got, tt.want)
 		}
 	}
@@ -294,7 +294,7 @@ func TestUsage(t *testing.T) {
 		t.Errorf("usage.String() = %q, want %q", got, want)
 	}
 
-	if u := parseUsage(nil); u != (usage{}) {
+	if u := parseUsage(nil); u != (Usage{}) {
 		t.Errorf("parseUsage(nil) = %+v, want zero value", u)
 	}
 	if got, want := parseUsage(nil).String(), "0 in / 0 out"; got != want {
@@ -302,16 +302,16 @@ func TestUsage(t *testing.T) {
 	}
 
 	// add accumulates every field.
-	a := usage{promptTokens: 1, completionTokens: 2, cachedTokens: 3, reasoningTokens: 4, cost: 5}
-	a.add(usage{promptTokens: 10, completionTokens: 20, cachedTokens: 30, reasoningTokens: 40, cost: 50})
-	want := usage{promptTokens: 11, completionTokens: 22, cachedTokens: 33, reasoningTokens: 44, cost: 55}
+	a := Usage{PromptTokens: 1, CompletionTokens: 2, CachedTokens: 3, ReasoningTokens: 4, Cost: 5}
+	a.add(Usage{PromptTokens: 10, CompletionTokens: 20, CachedTokens: 30, ReasoningTokens: 40, Cost: 50})
+	want := Usage{PromptTokens: 11, CompletionTokens: 22, CachedTokens: 33, ReasoningTokens: 44, Cost: 55}
 	if a != want {
 		t.Errorf("add = %+v, want %+v", a, want)
 	}
 
-	// delta subtracts a snapshot, including cost.
-	d := usage{promptTokens: 20, completionTokens: 10, cachedTokens: 6, reasoningTokens: 4, cost: 1.0}.
-		delta(usage{promptTokens: 15, completionTokens: 8, cachedTokens: 5, reasoningTokens: 3, cost: 0.75})
+	// Delta subtracts a snapshot, including cost.
+	d := Usage{PromptTokens: 20, CompletionTokens: 10, CachedTokens: 6, ReasoningTokens: 4, Cost: 1.0}.
+		Delta(Usage{PromptTokens: 15, CompletionTokens: 8, CachedTokens: 5, ReasoningTokens: 3, Cost: 0.75})
 	if got, want := d.String(), "5 in / 2 out (1 cached) (1 reasoning) $0.25000"; got != want {
 		t.Errorf("delta.String() = %q, want %q", got, want)
 	}
@@ -454,12 +454,12 @@ func TestHandleToolCall(t *testing.T) {
 
 func toolByName(t *testing.T, name string) Tool {
 	t.Helper()
-	for _, tt := range defaultTools {
+	for _, tt := range DefaultTools {
 		if tt.Name == name {
 			return tt
 		}
 	}
-	t.Fatalf("tool %q not found in defaultTools", name)
+	t.Fatalf("tool %q not found in DefaultTools", name)
 	return Tool{}
 }
 
@@ -468,7 +468,7 @@ func TestWriteTool(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "nested", "deep", "f.txt") // parents must be created
 
 	var displays []string
-	ctx := withDisplay(context.Background(), func(s string) { displays = append(displays, s) })
+	ctx := WithDisplay(context.Background(), func(s string) { displays = append(displays, s) })
 
 	out, err := tool.Handler(ctx, map[string]any{"path": p, "content": "hello\nworld"})
 	if err != nil {
@@ -560,7 +560,7 @@ func TestEditTool(t *testing.T) {
 	mustWrite(t, p, "alpha\nbeta\nalpha\n")
 
 	var displays []string
-	ctx := withDisplay(context.Background(), func(s string) { displays = append(displays, s) })
+	ctx := WithDisplay(context.Background(), func(s string) { displays = append(displays, s) })
 
 	out, err := tool.Handler(ctx, map[string]any{"path": p, "old_text": "beta", "new_text": "BETA"})
 	if err != nil || out != "ok" {
@@ -750,7 +750,7 @@ func TestGrepTool(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // AGENTS.md context files: contextFileIn, findContextFiles,
-// loadAgentsInstructions, projectPrompt.
+// loadAgentsInstructions, ProjectPrompt.
 // ---------------------------------------------------------------------------
 
 // TestContextFileIn pins the per-directory precedence: exactly one file is
@@ -866,13 +866,13 @@ func TestProjectPrompt(t *testing.T) {
 
 	empty := t.TempDir()
 	mustMkdir(t, filepath.Join(empty, "sub"))
-	if got := projectPrompt(base, filepath.Join(empty, "sub")); got != base {
-		t.Errorf("projectPrompt without context files = %q, want %q", got, base)
+	if got := ProjectPrompt(base, filepath.Join(empty, "sub")); got != base {
+		t.Errorf("ProjectPrompt without context files = %q, want %q", got, base)
 	}
 
 	tmp := t.TempDir()
 	mustWrite(t, filepath.Join(tmp, "AGENTS.md"), "always run `make test`")
-	got := projectPrompt(base, tmp)
+	got := ProjectPrompt(base, tmp)
 	for _, want := range []string{
 		"base prompt\n\nProject instructions",
 		"when instructions conflict, closer files win",
@@ -880,10 +880,10 @@ func TestProjectPrompt(t *testing.T) {
 		"always run `make test`",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("projectPrompt missing %q in:\n%s", want, got)
+			t.Errorf("ProjectPrompt missing %q in:\n%s", want, got)
 		}
 	}
 	if !strings.HasSuffix(got, "always run `make test`") {
-		t.Errorf("projectPrompt should end with the instructions, got tail %q", got[len(got)-80:])
+		t.Errorf("ProjectPrompt should end with the instructions, got tail %q", got[len(got)-80:])
 	}
 }

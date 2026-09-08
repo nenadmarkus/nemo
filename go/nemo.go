@@ -1,4 +1,9 @@
-package main
+// Package nemo is a minimal coding-agent library: an OpenAI-compatible
+// streaming chat client with a tool-use loop, a default workspace tool
+// set, and system-prompt assembly (workspace grounding plus
+// AGENTS.md/CLAUDE.md context files). The nemo command (cmd/nemo) wires
+// it into a terminal REPL.
+package nemo
 
 import (
 	"bufio"
@@ -11,14 +16,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -70,8 +73,9 @@ const (
 	llmStreamTimeout = 5 * time.Minute
 	// fetchTimeout caps one tool fetch.
 	fetchTimeout = 15 * time.Second
-	// runTimeout bounds the entire run, so a wedged run cannot hang forever.
-	runTimeout = 10 * time.Minute
+	// RunTimeout bounds an entire turn, so a wedged run cannot hang
+	// forever; the CLI applies it to each turn's context.
+	RunTimeout = 10 * time.Minute
 
 	// maxLLMResponseBytes caps one LLM response body.
 	maxLLMResponseBytes int64 = 1 << 20
@@ -105,8 +109,8 @@ const (
 tool defs
 */
 
-// systemPrompt is nemo's standing instruction to the model.
-const systemPrompt = "You are an expert coding assistant operating inside `nemo`, a coding agent harness. " +
+// SystemPrompt is nemo's standing instruction to the model.
+const SystemPrompt = "You are an expert coding assistant operating inside `nemo`, a coding agent harness. " +
 	"You help users by reading files, executing commands, editing code, and writing new files.\n\n" +
 	"Guidelines:\n" +
 	"* be minimal and brief\n" +
@@ -114,10 +118,10 @@ const systemPrompt = "You are an expert coding assistant operating inside `nemo`
 	"* be mindful with destructive and irreversible actions\n" +
 	"* ask the user to clarify intent if there is uncertainty"
 
-// groundedPrompt appends workspace facts (cwd, platform, today's date) to
+// GroundedPrompt appends workspace facts (cwd, platform, today's date) to
 // the base instructions so the model knows where and when it operates.
 // Computed once per process; a multi-hour session may see a stale date.
-func groundedPrompt(base string) string {
+func GroundedPrompt(base string) string {
 	cwd, err := os.Getwd()
 	if err != nil {
 	cwd = fmt.Sprintf("(unknown: %v)", err)
@@ -200,13 +204,13 @@ func loadAgentsInstructions(dir string) string {
 	if len(blocks) == 0 {
 		return ""
 	}
-	return truncateUTF8(strings.Join(blocks, "\n\n"), maxAgentsBytes, "\n...[instructions truncated]")
+	return TruncateUTF8(strings.Join(blocks, "\n\n"), maxAgentsBytes, "\n...[instructions truncated]")
 }
 
-// projectPrompt appends any AGENTS.md/CLAUDE.md project instructions to
+// ProjectPrompt appends any AGENTS.md/CLAUDE.md project instructions to
 // base so repo conventions ride along in the system prompt; base is
 // returned unchanged when the workspace has no context files.
-func projectPrompt(base, dir string) string {
+func ProjectPrompt(base, dir string) string {
 	instr := loadAgentsInstructions(dir)
 	if instr == "" {
 		return base
@@ -345,8 +349,8 @@ func walkTree(root string, fn func(path string)) error {
 // into the model's context.
 type displayKey struct{}
 
-// withDisplay returns a context carrying f as the display emitter.
-func withDisplay(ctx context.Context, f func(string)) context.Context {
+// WithDisplay returns a context carrying f as the display emitter.
+func WithDisplay(ctx context.Context, f func(string)) context.Context {
 	return context.WithValue(ctx, displayKey{}, f)
 }
 
@@ -472,7 +476,7 @@ func diffLines(path string, old, nw []string, isNewFile bool) string {
 			b.WriteString("[...diff truncated...]\n")
 			break
 		}
-		fmt.Fprintf(&b, "%c %s\n", op.mark, truncateUTF8(op.line, 200, " ..."))
+		fmt.Fprintf(&b, "%c %s\n", op.mark, TruncateUTF8(op.line, 200, " ..."))
 	}
 	return b.String()
 }
@@ -495,9 +499,9 @@ func containsCwd(dir string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// defaultTools is the tool set the root agent runs with; Agent.Run itself
+// DefaultTools is the tool set the root agent runs with; Agent.Run itself
 // is tool-agnostic and takes its tools via the Agent.
-var defaultTools = []Tool{
+var DefaultTools = []Tool{
 	{
 		Name:        "fetch",
 		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
@@ -600,7 +604,7 @@ var defaultTools = []Tool{
 
 			out := string(data)
 			if int64(len(data)) > maxBytes {
-				out = truncateUTF8(out, int(maxBytes), "\n...[truncated]")
+				out = TruncateUTF8(out, int(maxBytes), "\n...[truncated]")
 			}
 			if readable {
 				out = extractText(out)
@@ -866,7 +870,7 @@ var defaultTools = []Tool{
 				sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 				for i := 1; sc.Scan(); i++ {
 					if re.MatchString(sc.Text()) {
-						out = append(out, fmt.Sprintf("%s:%d: %s", path, i, truncateUTF8(sc.Text(), 500, " ...")))
+						out = append(out, fmt.Sprintf("%s:%d: %s", path, i, TruncateUTF8(sc.Text(), 500, " ...")))
 						if len(out) >= 100 {
 							out = append(out, "...[truncated at 100 matches]")
 							break
@@ -1027,9 +1031,9 @@ func readCapped(r io.Reader, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-// truncateUTF8 cuts s to at most limit bytes without splitting a multi-byte
+// TruncateUTF8 cuts s to at most limit bytes without splitting a multi-byte
 // rune, appending marker when something was cut.
-func truncateUTF8(s string, limit int, marker string) string {
+func TruncateUTF8(s string, limit int, marker string) string {
 	if len(s) <= limit {
 		return s
 	}
@@ -1103,7 +1107,7 @@ func llmCall(ctx context.Context, url, apiKey string, payload []byte) (int, []by
 				return resp.StatusCode, respBody, nil
 			} else {
 				err = fmt.Errorf("upstream %s: %s", resp.Status,
-					truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
+					TruncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
 			}
 		} else {
 			cancel()
@@ -1130,36 +1134,36 @@ func llmCall(ctx context.Context, url, apiKey string, payload []byte) (int, []by
 	}
 }
 
-// usage is token/cost accounting for one LLM request, following the
+// Usage is token/cost accounting for one LLM request, following the
 // OpenAI/OpenRouter "usage" object: prompt_tokens / completion_tokens
 // (total = sum), with prompt_tokens_details.cached_tokens counted inside
 // prompt tokens and completion_tokens_details.reasoning_tokens inside
 // completion tokens. OpenRouter adds cost (USD). JSON numbers arrive as
 // float64 and are converted; fields the provider omits stay zero.
-type usage struct {
-	promptTokens     int64
-	completionTokens int64
-	cachedTokens     int64 // subset of promptTokens
-	reasoningTokens  int64 // subset of completionTokens
-	cost             float64
+type Usage struct {
+	PromptTokens     int64
+	CompletionTokens int64
+	CachedTokens     int64 // subset of PromptTokens
+	ReasoningTokens  int64 // subset of CompletionTokens
+	Cost             float64
 }
 
 // parseUsage extracts a usage object; a nil map yields the zero value.
-func parseUsage(m map[string]any) usage {
-	var u usage
+func parseUsage(m map[string]any) Usage {
+	var u Usage
 	if m == nil {
 		return u
 	}
-	u.promptTokens = numAs(m, "prompt_tokens")
-	u.completionTokens = numAs(m, "completion_tokens")
+	u.PromptTokens = numAs(m, "prompt_tokens")
+	u.CompletionTokens = numAs(m, "completion_tokens")
 	if d, ok := m["prompt_tokens_details"].(map[string]any); ok {
-		u.cachedTokens = numAs(d, "cached_tokens")
+		u.CachedTokens = numAs(d, "cached_tokens")
 	}
 	if d, ok := m["completion_tokens_details"].(map[string]any); ok {
-		u.reasoningTokens = numAs(d, "reasoning_tokens")
+		u.ReasoningTokens = numAs(d, "reasoning_tokens")
 	}
 	if c, ok := m["cost"].(float64); ok {
-		u.cost = c
+		u.Cost = c
 	}
 	return u
 }
@@ -1173,36 +1177,36 @@ func numAs(m map[string]any, key string) int64 {
 }
 
 // add accumulates other into u.
-func (u *usage) add(other usage) {
-	u.promptTokens += other.promptTokens
-	u.completionTokens += other.completionTokens
-	u.cachedTokens += other.cachedTokens
-	u.reasoningTokens += other.reasoningTokens
-	u.cost += other.cost
+func (u *Usage) add(other Usage) {
+	u.PromptTokens += other.PromptTokens
+	u.CompletionTokens += other.CompletionTokens
+	u.CachedTokens += other.CachedTokens
+	u.ReasoningTokens += other.ReasoningTokens
+	u.Cost += other.Cost
 }
 
-// delta returns how much u has grown relative to an earlier snapshot.
-func (u usage) delta(base usage) usage {
-	return usage{
-		promptTokens:     u.promptTokens - base.promptTokens,
-		completionTokens: u.completionTokens - base.completionTokens,
-		cachedTokens:     u.cachedTokens - base.cachedTokens,
-		reasoningTokens:  u.reasoningTokens - base.reasoningTokens,
-		cost:             u.cost - base.cost,
+// Delta returns how much u has grown relative to an earlier snapshot.
+func (u Usage) Delta(base Usage) Usage {
+	return Usage{
+		PromptTokens:     u.PromptTokens - base.PromptTokens,
+		CompletionTokens: u.CompletionTokens - base.CompletionTokens,
+		CachedTokens:     u.CachedTokens - base.CachedTokens,
+		ReasoningTokens:  u.ReasoningTokens - base.ReasoningTokens,
+		Cost:             u.Cost - base.Cost,
 	}
 }
 
 // String renders a compact report; details are included only when present.
-func (u usage) String() string {
-	s := fmt.Sprintf("%d in / %d out", u.promptTokens, u.completionTokens)
-	if u.cachedTokens > 0 {
-		s += fmt.Sprintf(" (%d cached)", u.cachedTokens)
+func (u Usage) String() string {
+	s := fmt.Sprintf("%d in / %d out", u.PromptTokens, u.CompletionTokens)
+	if u.CachedTokens > 0 {
+		s += fmt.Sprintf(" (%d cached)", u.CachedTokens)
 	}
-	if u.reasoningTokens > 0 {
-		s += fmt.Sprintf(" (%d reasoning)", u.reasoningTokens)
+	if u.ReasoningTokens > 0 {
+		s += fmt.Sprintf(" (%d reasoning)", u.ReasoningTokens)
 	}
-	if u.cost > 0 {
-		s += fmt.Sprintf(" $%.5f", u.cost)
+	if u.Cost > 0 {
+		s += fmt.Sprintf(" $%.5f", u.Cost)
 	}
 	return s
 }
@@ -1214,7 +1218,7 @@ type sseResult struct {
 	assistant    map[string]any
 	streamed     bool
 	finishReason string
-	usage        usage
+	usage        Usage
 }
 
 // readSSEStream reads an OpenAI-style SSE response, calling onReasoning and
@@ -1232,7 +1236,7 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 	var toolCalls []any
 	streamed := false
 	finishReason := ""
-	var streamUsage usage
+	var streamUsage Usage
 
 	addToolCall := func(tc any) {
 		tcm, ok := tc.(map[string]any)
@@ -1290,7 +1294,7 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			if onSystem != nil {
 				onSystem(fmt.Sprintf("skipped malformed stream chunk: %s",
-					truncateUTF8(data, 256, " ...")))
+					TruncateUTF8(data, 256, " ...")))
 			}
 			continue
 		}
@@ -1450,11 +1454,11 @@ func llmCallStream(
 				cancel()
 				if err == nil {
 					err = fmt.Errorf("upstream %s: %s", resp.Status,
-						truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
+						TruncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]"))
 				}
 				if onSystem != nil {
 					onSystem(fmt.Sprintf("upstream %s: %s", resp.Status,
-						truncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]")))
+						TruncateUTF8(strings.TrimSpace(string(respBody)), 1024, " ...[truncated]")))
 				}
 			} else {
 				res, readErr := readSSEStream(resp.Body, onReasoning, onContent, onSystem)
@@ -1509,7 +1513,7 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 	call, ok := tci.(map[string]any)
 	if !ok {
 		if raw, err := json.Marshal(tci); err == nil {
-			return "", fmt.Sprintf("invalid tool call: %s", truncateUTF8(string(raw), 512, " ...")), nil
+			return "", fmt.Sprintf("invalid tool call: %s", TruncateUTF8(string(raw), 512, " ...")), nil
 		}
 		return "", "invalid tool call: expected an object with id and function", nil
 	}
@@ -1545,16 +1549,17 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 	return callID, result, nil
 }
 
-// session is one ongoing conversation: the running user/assistant/tool
+// Session is one ongoing conversation: the running user/assistant/tool
 // history, so context persists across turns, plus cumulative token/cost
 // accounting as reported by the provider.
-type session struct {
-	messages []map[string]any
-	usage    usage
+type Session struct {
+	Messages []map[string]any
+	Usage    Usage
 }
 
-func newSession() *session {
-	return &session{}
+// NewSession returns an empty Session.
+func NewSession() *Session {
+	return &Session{}
 }
 
 // Agent is the static configuration of one assistant loop: where to call,
@@ -1581,17 +1586,17 @@ type Agent struct {
 // instructions.
 func (ag *Agent) Run(
 	ctx context.Context,
-	s *session,
+	s *Session,
 	message string,
 	onReasoning, onContent, onSystem func(string),
 	onTool func(callID, name, args string, ok bool, detail string),
 ) error {
 
 	addMessage := func(msg map[string]any) {
-		s.messages = append(s.messages, msg)
+		s.Messages = append(s.Messages, msg)
 	}
 
-	if len(s.messages) == 0 && ag.SystemPrompt != "" {
+	if len(s.Messages) == 0 && ag.SystemPrompt != "" {
 		addMessage(map[string]any{"role": "system", "content": ag.SystemPrompt})
 	}
 	addMessage(map[string]any{
@@ -1624,7 +1629,7 @@ func (ag *Agent) Run(
 
 		reqBody := map[string]any{
 			"model":       ag.Model,
-			"messages":    s.messages,
+			"messages":    s.Messages,
 			"tools":       specs,
 			"tool_choice": "auto",
 		}
@@ -1637,7 +1642,7 @@ func (ag *Agent) Run(
 		if err != nil {
 			return err
 		}
-		s.usage.add(res.usage)
+		s.Usage.add(res.usage)
 		msg := res.assistant
 
 		addMessage(msg)
@@ -1650,7 +1655,7 @@ func (ag *Agent) Run(
 					nudges++
 					// Drop the empty assistant message and poke the model;
 					// the nudge stays in history after recovery.
-					s.messages = s.messages[:len(s.messages)-1]
+					s.Messages = s.Messages[:len(s.Messages)-1]
 					if onSystem != nil {
 						onSystem(fmt.Sprintf("empty reply (finish_reason: %q); nudging the model to answer",
 							res.finishReason))
@@ -1687,7 +1692,7 @@ func (ag *Agent) Run(
 				onTool(callID, name, argStr, callErr == nil, toolResult)
 			}
 
-			toolResult = truncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
+			toolResult = TruncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
 
 			addMessage(map[string]any{
 				"role":         "tool",
@@ -1698,235 +1703,4 @@ func (ag *Agent) Run(
 	}
 
 	return fmt.Errorf("max iterations reached")
-}
-
-func main() {
-
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: OPENROUTER_API_KEY not set")
-		return
-	}
-
-	root := &Agent{
-		Name:         "root",
-		Endpoint:     "https://openrouter.ai/api/v1/chat/completions",
-		APIKey:       apiKey,
-		Model:        "deepseek/deepseek-v4-flash-0731",
-		Tools:        defaultTools,
-		Provider:     map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true},
-		SystemPrompt: projectPrompt(groundedPrompt(systemPrompt), "."),
-	}
-
-	// Stream callbacks: render reasoning/output/tool/system blocks, each
-	// starting on a fresh line with its own header so phases are unmistakable.
-	const (
-		blockNone      = 0
-		blockReasoning = 1
-		blockOutput    = 2
-		blockTool      = 3
-		blockSystem    = 4
-	)
-	currentBlock := blockNone
-	printedAny := false
-	lineOpen := false
-
-	// stdout primitives; lineOpen tracks whether the last stdout write ended
-	// with a newline.
-	emitLine := func(s string) {
-		fmt.Fprintln(os.Stdout, s)
-		lineOpen = true
-	}
-	closeLine := func() {
-		if !lineOpen {
-			emitLine("")
-		}
-	}
-
-	// beginStdout starts a reasoning/output/tool block on stdout.
-	beginStdout := func(kind int, header string) {
-		if currentBlock == kind {
-			return
-		}
-		closeLine()
-		if printedAny {
-			emitLine("")
-		}
-		emitLine(header)
-		printedAny = true
-		currentBlock = kind
-	}
-
-	onReasoning := func(s string) {
-		beginStdout(blockReasoning, "[reasoning]")
-		fmt.Fprint(os.Stdout, s)
-		lineOpen = false
-	}
-
-	onContent := func(s string) {
-		beginStdout(blockOutput, "[output]")
-		fmt.Fprint(os.Stdout, s)
-		lineOpen = false
-	}
-
-	onSystem := func(s string) {
-		if currentBlock != blockSystem {
-			closeLine()
-			if printedAny {
-				fmt.Fprintln(os.Stderr, "")
-			}
-			printedAny = true
-			currentBlock = blockSystem
-		}
-		oneLine := strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
-		fmt.Fprintf(os.Stderr, "[system] %s\n", truncateUTF8(oneLine, 1024, " ..."))
-	}
-
-	onTool := func(callID, name, args string, ok bool, detail string) {
-		label := name
-		if callID != "" {
-			label = callID + " " + name
-		}
-		beginStdout(blockTool, "[tool: "+label+"]")
-		argOneLine := strings.ReplaceAll(args, "\n", " ")
-		emitLine(truncateUTF8(argOneLine, 128, " ..."))
-		if ok {
-			emitLine("ok:")
-			emitLine(truncateUTF8(detail, 128, " ..."))
-		} else {
-			emitLine("error:")
-			emitLine(truncateUTF8(detail, 512, " ..."))
-		}
-		// Each tool call is its own block; the next phase starts fresh.
-		currentBlock = blockNone
-	}
-
-	// onDiff renders a write/edit diff block on stdout.
-	onDiff := func(s string) {
-		closeLine()
-		if printedAny {
-			fmt.Fprintln(os.Stdout, "")
-		}
-		fmt.Fprint(os.Stdout, s)
-		if !strings.HasSuffix(s, "\n") {
-			fmt.Fprintln(os.Stdout, "")
-		}
-		printedAny = true
-		// Each diff is its own block; the next phase starts fresh.
-		currentBlock = blockNone
-		lineOpen = true
-	}
-
-	s := newSession()
-
-	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
-
-	// Signals: Ctrl-C/SIGTERM during a run cancels just that turn; at the
-	// prompt it discards the pending line (the tty does that anyway) and a
-	// second consecutive press exits. Default signal disposition is never
-	// relied on, so a stray SIGINT cannot kill the session.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-	// stdin is read from a goroutine so the prompt can select on input
-	// and signals at once.
-	lines := make(chan string)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-		close(lines)
-	}()
-
-	idleInterrupts := 0
-	for {
-		fmt.Print("\n> ")
-		var input string
-		select {
-		case line, ok := <-lines:
-			if !ok { // EOF (Ctrl-D)
-				fmt.Println()
-				return
-			}
-			input = strings.TrimSpace(line)
-		case <-sigCh:
-			idleInterrupts++
-			if idleInterrupts >= 2 {
-				fmt.Println("\nbye")
-				return
-			}
-			fmt.Fprintln(os.Stderr, "\n(to quit: Ctrl+D or \"exit\"; during a run, Ctrl+C aborts the turn)")
-			continue
-		}
-		if input == "" {
-			continue
-		}
-		if input == "exit" || input == "quit" {
-			return
-		}
-		idleInterrupts = 0
-
-		// The turn runs on its own context: runTimeout bounds it, and the
-		// select below can cancel it on a signal without touching the
-		// session or the process. The display emitter rides in the ctx so
-		// write/edit can print diffs without a special result channel.
-		baseCtx := withDisplay(context.Background(), onDiff)
-		turnCtx, cancel := context.WithTimeout(baseCtx, runTimeout)
-		before := len(s.messages)
-		uBefore := s.usage
-
-		// reportUsage prints the turn's token/cost delta plus session
-		// totals; silent when the provider reports no usage.
-		reportUsage := func() {
-			if turn := s.usage.delta(uBefore); turn.promptTokens > 0 || turn.completionTokens > 0 {
-				fmt.Fprintf(os.Stderr, "[usage] turn: %s | session: %s\n", turn, s.usage)
-			}
-		}
-
-		runDone := make(chan error, 1)
-		go func() {
-			runDone <- root.Run(turnCtx, s, input,
-				onReasoning, onContent, onSystem, onTool)
-		}()
-
-		var err error
-		interrupted := false
-		select {
-		case err = <-runDone:
-		case <-sigCh:
-			cancel()
-			interrupted = true
-			err = <-runDone // wait for the run to unwind
-			// A second press while unwinding means "really quit".
-			select {
-			case <-sigCh:
-				fmt.Println("\nbye")
-				return
-			default:
-			}
-		}
-		cancel()
-
-		if err != nil {
-			// Drop a partial exchange (e.g. tool_calls without their
-			// results) so the history stays valid for the next turn.
-			s.messages = s.messages[:before]
-			if interrupted {
-				fmt.Fprintln(os.Stderr, "\n[interrupted; turn dropped]")
-			} else {
-				fmt.Fprintln(os.Stderr, "error:", err)
-			}
-			reportUsage()
-			continue
-		}
-		if interrupted {
-			// Race: the turn completed before the cancel took effect.
-			fmt.Fprintln(os.Stderr, "\n[turn completed before interrupt; kept]")
-		}
-		reportUsage()
-
-		fmt.Println()
-	}
 }
