@@ -217,7 +217,7 @@
       <td>Latency win when the model issues independent calls</td>
       <td>M</td>
       <td class="prio p2">P2</td>
-      <td>—</td>
+      <td class="done">✅ done***</td>
     </tr>
     <tr>
       <td>15</td>
@@ -277,7 +277,8 @@
 </table>
 
 <p class="note">* #18: empty-reply nudge implemented; <code>finish_reason=length</code> continuation deferred to #17/#3 (needs <code>max_tokens</code> config).<br>
-** #5: root-level <code>.gitignore</code> honored (S); nested <code>.gitignore</code> files and parent-repo ignores deferred (M).</p>
+** #5: root-level <code>.gitignore</code> honored (S); nested <code>.gitignore</code> files and parent-repo ignores deferred (M).<br>
+*** #14: read-only calls in one message run concurrently (capped at 8); <code>write</code>/<code>edit</code>/<code>delete</code> serialize among themselves in issue order (no lost updates); results and diff previews are reported in call order.</p>
 
 <p><strong>Explicitly out of scope for “basic”</strong> (pi has them, but they’re a later layer): MCP client, extensions, skills, packages, subagents, themes/keybindings (TUI territory).</p>
 

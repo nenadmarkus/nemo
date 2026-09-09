@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -103,6 +104,12 @@ const (
 	maxRetries = 3
 	// maxBackoff caps the sleep between LLM retries.
 	maxBackoff = 5 * time.Second
+
+	// maxConcurrentToolCalls bounds how many handlers from one tool-call
+	// batch execute at once, so a model gone wild with a huge parallel
+	// batch cannot open an unbounded pile of sockets or file handles.
+	// Mutating calls run inline (one at a time) outside the pool.
+	maxConcurrentToolCalls = 8
 )
 
 /*
@@ -116,6 +123,7 @@ const SystemPrompt = "You are an expert coding assistant operating inside `nemo`
 	"* be minimal and brief\n" +
 	"* show file paths clearly when working with files\n" +
 	"* be mindful with destructive and irreversible actions\n" +
+	"* when several tool calls are independent, issue them all in one message so they run in parallel\n" +
 	"* ask the user to clarify intent if there is uncertainty"
 
 // GroundedPrompt appends workspace facts (cwd, platform, today's date) to
@@ -225,7 +233,13 @@ type Tool struct {
 	Name        string
 	Description string
 	Parameters  map[string]any
-	Handler     func(ctx context.Context, args map[string]any) (string, error)
+	// Mutating marks a tool that changes state (write, edit, delete).
+	// When one assistant message carries several tool calls, non-mutating
+	// handlers run in parallel while mutating ones execute one at a time
+	// in issue order, so independent reads overlap but read-modify-write
+	// tools cannot race each other.
+	Mutating bool
+	Handler  func(ctx context.Context, args map[string]any) (string, error)
 }
 
 // gitignoreRule is one parsed .gitignore line.
@@ -701,7 +715,8 @@ var DefaultTools = []Tool{
 			},
 			"required": []string{"path", "content"},
 		},
-		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+		Mutating: true,
+		Handler:  func(ctx context.Context, args map[string]any) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
 				return "", fmt.Errorf("path is required")
@@ -742,7 +757,8 @@ var DefaultTools = []Tool{
 			},
 			"required": []string{"path", "old_text", "new_text"},
 		},
-		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+		Mutating: true,
+		Handler:  func(ctx context.Context, args map[string]any) (string, error) {
 			path, _ := args["path"].(string)
 			oldText, _ := args["old_text"].(string)
 			newText, _ := args["new_text"].(string)
@@ -782,7 +798,8 @@ var DefaultTools = []Tool{
 			},
 			"required": []string{"path"},
 		},
-		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+		Mutating: true,
+		Handler:  func(ctx context.Context, args map[string]any) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
 				return "", fmt.Errorf("path is required")
@@ -1549,6 +1566,126 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 	return callID, result, nil
 }
 
+// Parallel tool-call execution.
+
+// toolCallResult carries the outcome of one call in a tool-call batch:
+// the pieces needed to report it (onTool) and append its tool message in
+// call order, plus any display output (diff previews) the handler
+// emitted, buffered for ordered replay.
+type toolCallResult struct {
+	callID   string
+	name     string // function name the model called ("" when malformed)
+	argStr   string // raw arguments JSON the model sent
+	out      string // result text, or the error text when callErr != nil
+	callErr  error  // non-nil when the handler itself failed
+	displays []string
+}
+
+// toolCallMeta extracts the function name and raw arguments string from
+// a tool_calls entry ("" when malformed).
+func toolCallMeta(tci any) (name, argStr string) {
+	call, ok := tci.(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	fn, ok := call["function"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	name, _ = fn["name"].(string)
+	argStr, _ = fn["arguments"].(string)
+	return name, argStr
+}
+
+// lookupTool returns the registered tool a tool_calls entry names; the
+// zero Tool (not Mutating) when the entry is malformed or the tool is
+// unknown — either way handleToolCall reports it, no side effects.
+func lookupTool(registry map[string]Tool, tci any) Tool {
+	name, _ := toolCallMeta(tci)
+	return registry[name]
+}
+
+// runOneToolCall executes a single call from a batch. The handler runs
+// with a per-call display collector in its context instead of the
+// caller's emitter: parallel handlers must not share the emitter (the
+// CLI's callback mutates console state), and buffered previews can be
+// replayed in call order once the batch is done.
+func runOneToolCall(ctx context.Context, registry map[string]Tool, i int, tci any) toolCallResult {
+	var mu sync.Mutex
+	var displays []string
+	callCtx := WithDisplay(ctx, func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		displays = append(displays, s)
+	})
+	callID, out, callErr := handleToolCall(callCtx, registry, i, tci)
+	name, argStr := toolCallMeta(tci)
+	return toolCallResult{
+		callID:   callID,
+		name:     name,
+		argStr:   argStr,
+		out:      out,
+		callErr:  callErr,
+		displays: displays,
+	}
+}
+
+// processToolCalls executes the tool calls the model issued in one
+// assistant message and reports them. Non-mutating calls run
+// concurrently, bounded by maxConcurrentToolCalls; mutating calls
+// (write/edit/delete) execute inline, one at a time in issue order, so
+// read-modify-write tools never race each other — two concurrent edits
+// could otherwise lose an update. Tool messages are appended, and
+// buffered previews replayed through the caller's display emitter, in
+// call order regardless of completion order, keeping the history
+// deterministic (tool_call_ids stay paired in sequence) and the console
+// coherent. A handler error is reported as that call's tool message, not
+// a batch failure.
+func processToolCalls(
+	ctx context.Context,
+	registry map[string]Tool,
+	toolCalls []any,
+	onTool func(callID, name, args string, ok bool, detail string),
+	addMessage func(msg map[string]any),
+) {
+	results := make([]toolCallResult, len(toolCalls))
+	sem := make(chan struct{}, maxConcurrentToolCalls)
+	var wg sync.WaitGroup
+	for i, tci := range toolCalls {
+		if lookupTool(registry, tci).Mutating {
+			// Inline: at most one mutating call runs at any moment, in
+			// issue order, while any parallel reads continue alongside.
+			results[i] = runOneToolCall(ctx, registry, i, tci)
+			continue
+		}
+		wg.Add(1)
+		go func(i int, tci any) {
+			defer wg.Done()
+			sem <- struct{}{} // bound concurrent handlers
+			defer func() { <-sem }()
+			results[i] = runOneToolCall(ctx, registry, i, tci)
+		}(i, tci)
+	}
+	wg.Wait()
+
+	display := displayFrom(ctx)
+	for _, r := range results {
+		for _, d := range r.displays {
+			if display != nil {
+				display(d)
+			}
+		}
+		if onTool != nil {
+			onTool(r.callID, r.name, r.argStr, r.callErr == nil, r.out)
+		}
+		addMessage(map[string]any{
+			"role":         "tool",
+			"tool_call_id": r.callID,
+			"content":      TruncateUTF8(r.out, maxToolResultBytes, "\n[...truncated...]"),
+		})
+	}
+}
+
 // Session is one ongoing conversation: the running user/assistant/tool
 // history, so context persists across turns, plus cumulative token/cost
 // accounting as reported by the provider.
@@ -1676,30 +1813,10 @@ func (ag *Agent) Run(
 			return nil
 		}
 
-		// process tool calls
-		for n, tci := range toolCalls {
-			callID, toolResult, callErr := handleToolCall(ctx, registry, n, tci)
-
-			if onTool != nil {
-				name := ""
-				argStr := ""
-				if tciMap, ok := tci.(map[string]any); ok {
-					if fn, ok := tciMap["function"].(map[string]any); ok {
-						name, _ = fn["name"].(string)
-						argStr, _ = fn["arguments"].(string)
-					}
-				}
-				onTool(callID, name, argStr, callErr == nil, toolResult)
-			}
-
-			toolResult = TruncateUTF8(toolResult, maxToolResultBytes, "\n[...truncated...]")
-
-			addMessage(map[string]any{
-				"role":         "tool",
-				"tool_call_id": callID,
-				"content":      toolResult,
-			})
-		}
+		// Execute the model's tool calls: independent calls issued in one
+		// message run concurrently (mutating ones serialize among
+		// themselves); reporting and history stay in call order.
+		processToolCalls(ctx, registry, toolCalls, onTool, addMessage)
 	}
 
 	return fmt.Errorf("max iterations reached")

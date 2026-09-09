@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -445,6 +446,156 @@ func TestHandleToolCall(t *testing.T) {
 	})
 	if err != nil || out != "invalid tool call: function missing or not an object" {
 		t.Errorf("non-object function = (%q, %v), want (invalid tool call: function missing..., nil)", out, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// processToolCalls (parallel tool-call batches).
+// ---------------------------------------------------------------------------
+
+// batchCall builds a tool_calls entry shaped like the ones the model
+// sends (arguments as a JSON string, as after SSE assembly).
+func batchCall(id, name, args string) map[string]any {
+	return map[string]any{
+		"id":       id,
+		"function": map[string]any{"name": name, "arguments": args},
+	}
+}
+
+func TestProcessToolCallsParallel(t *testing.T) {
+	// Two read-only handlers that each block until both have started:
+	// only concurrent execution gets past the second receive (a
+	// sequential loop would hang on the first handler's <-release).
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	reg := map[string]Tool{
+		"r": {Name: "r", Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			started <- args["x"].(string)
+			<-release
+			return "done " + args["x"].(string), nil
+		}},
+	}
+	calls := []any{
+		batchCall("a", "r", `{"x":"a"}`),
+		batchCall("b", "r", `{"x":"b"}`),
+	}
+
+	type report struct{ id, name, args, detail string; ok bool }
+	var got []report
+	var messages []map[string]any
+	done := make(chan struct{})
+	go func() {
+		processToolCalls(context.Background(), reg, calls,
+			func(callID, name, args string, ok bool, detail string) {
+				got = append(got, report{callID, name, args, detail, ok})
+			},
+			func(msg map[string]any) { messages = append(messages, msg) })
+		close(done)
+	}()
+
+	// Both handlers must reach their start point without any release.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("tool calls did not run concurrently")
+		}
+	}
+	close(release)
+	<-done
+
+	// Reported in call order (completion order is arbitrary here), with
+	// each call's id, name, args, and output.
+	want := []report{
+		{"a", "r", `{"x":"a"}`, "done a", true},
+		{"b", "r", `{"x":"b"}`, "done b", true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("onTool reports = %v, want %v", got, want)
+	}
+	// Tool messages appended in call order, ids paired in sequence.
+	if len(messages) != 2 ||
+		messages[0]["tool_call_id"] != "a" || messages[1]["tool_call_id"] != "b" ||
+		messages[0]["content"] != "done a" || messages[1]["content"] != "done b" {
+		t.Errorf("tool messages = %v, want a then b in call order", messages)
+	}
+}
+
+func TestProcessToolCallsMutatingSerialized(t *testing.T) {
+	// Two read-modify-write appends to one file in a single batch must
+	// both land: mutating handlers execute in issue order, never
+	// concurrently (a lost update would leave "a" or "b" missing).
+	p := filepath.Join(t.TempDir(), "log.txt")
+	mustWrite(t, p, "")
+	reg := map[string]Tool{
+		"append": {Name: "append", Mutating: true, Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return "", err
+			}
+			// Sleep inside the read-modify-write window so concurrent
+			// execution would reliably lose one update.
+			time.Sleep(25 * time.Millisecond)
+			if err := os.WriteFile(p, []byte(string(data)+args["ch"].(string)), 0o644); err != nil {
+				return "", err
+			}
+			return "ok", nil
+		}},
+	}
+	calls := []any{
+		batchCall("w1", "append", `{"ch":"a"}`),
+		batchCall("w2", "append", `{"ch":"b"}`),
+	}
+
+	var messages []map[string]any
+	processToolCalls(context.Background(), reg, calls, nil,
+		func(msg map[string]any) { messages = append(messages, msg) })
+
+	data, err := os.ReadFile(p)
+	if err != nil || string(data) != "ab" {
+		t.Errorf("file = %q (%v), want %q: both appends must land", data, err, "ab")
+	}
+	if len(messages) != 2 || messages[0]["tool_call_id"] != "w1" || messages[1]["tool_call_id"] != "w2" {
+		t.Errorf("tool messages = %v, want w1 then w2 in issue order", messages)
+	}
+}
+
+func TestProcessToolCallsDisplayReplay(t *testing.T) {
+	// Diff previews emitted by parallel handlers are buffered per call
+	// and replayed in call order: the slow first call's preview must be
+	// shown before the fast second call's even though the second call
+	// finishes first (a shared emitter would show them out of order).
+	reg := map[string]Tool{
+		"slow": {Name: "slow", Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			if d := displayFrom(ctx); d != nil {
+				d("preview-1")
+			}
+			time.Sleep(30 * time.Millisecond)
+			return "slow done", nil
+		}},
+		"fast": {Name: "fast", Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			if d := displayFrom(ctx); d != nil {
+				d("preview-2")
+			}
+			return "fast done", nil
+		}},
+	}
+	var shown []string
+	ctx := WithDisplay(context.Background(), func(s string) { shown = append(shown, s) })
+	calls := []any{
+		batchCall("c1", "slow", "{}"),
+		batchCall("c2", "fast", "{}"),
+	}
+	var order []string
+	processToolCalls(ctx, reg, calls,
+		func(callID, name, args string, ok bool, detail string) { order = append(order, callID) },
+		func(msg map[string]any) {})
+
+	if want := []string{"preview-1", "preview-2"}; !reflect.DeepEqual(shown, want) {
+		t.Errorf("display order = %v, want %v", shown, want)
+	}
+	if want := []string{"c1", "c2"}; !reflect.DeepEqual(order, want) {
+		t.Errorf("onTool order = %v, want %v", order, want)
 	}
 }
 
