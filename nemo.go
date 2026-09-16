@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,6 +93,11 @@ const (
 	// block an omitted type would inherit int64 from maxToolResultBytes.)
 	maxReadLines int   = 2000
 	maxReadBytes int64 = 48 << 10
+
+	// maxImageBytes caps one image attachment (raw bytes, before the
+	// ~4/3 base64 inflation in the request): 4 MiB encodes to ~5.5 MiB,
+	// inside the tightest provider limit (Anthropic accepts ~5 MiB).
+	maxImageBytes int64 = 4 << 20
 
 	// maxAgentsBytes caps the combined AGENTS.md/CLAUDE.md project
 	// instructions injected into the system prompt.
@@ -374,6 +380,58 @@ func displayFrom(ctx context.Context) func(string) {
 	return f
 }
 
+// ImageAttachment is one image riding with a tool result, sent to the
+// model as a multimodal image_url content part.
+type ImageAttachment struct {
+	MediaType string // MIME type, e.g. "image/png"
+	Data      []byte // raw image bytes; base64-encoded once, at message-build time
+}
+
+// attachmentKey keys the attachment collector carried in the run context;
+// the read tool uses it to hand images to processToolCalls without
+// changing the Tool handler signature — the same trick as the display
+// emitter.
+type attachmentKey struct{}
+
+// WithAttachments returns a context carrying sink as the attachment
+// collector.
+func WithAttachments(ctx context.Context, sink func(ImageAttachment)) context.Context {
+	return context.WithValue(ctx, attachmentKey{}, sink)
+}
+
+// attachFrom returns the attachment collector in ctx, or nil when absent.
+func attachFrom(ctx context.Context) func(ImageAttachment) {
+	f, _ := ctx.Value(attachmentKey{}).(func(ImageAttachment))
+	return f
+}
+
+// imageMediaTypes are the raster formats providers accept as vision
+// input; SVG is deliberately excluded (no provider renders it).
+var imageMediaTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+	"image/bmp":  true,
+}
+
+// sniffImage returns the media type when data begins with a supported
+// raster image signature, "" otherwise. Sniffing the actual bytes (rather
+// than trusting the extension) keeps a text file named .png readable as
+// text and catches extension-less images.
+func sniffImage(data []byte) string {
+	ct := http.DetectContentType(data) // considers at most the first 512 bytes
+	if imageMediaTypes[ct] {
+		return ct
+	}
+	return ""
+}
+
+// imageDataURL renders img as a data: URL for an image_url content part.
+func imageDataURL(img ImageAttachment) string {
+	return "data:" + img.MediaType + ";base64," + base64.StdEncoding.EncodeToString(img.Data)
+}
+
 // diffOp is one rendered diff line: ' ' context, '-' removed, '+' added.
 type diffOp struct {
 	mark byte
@@ -632,7 +690,8 @@ var DefaultTools = []Tool{
 		Name: "read",
 		Description: "read a text file; lines are prefixed with 1-indexed line numbers like \"123| text\" " +
 			"(strip that prefix when quoting file text elsewhere, e.g. in edit's old_text); " +
-			"offset is the 1-indexed first line, limit caps the line count",
+			"offset is the 1-indexed first line, limit caps the line count; " +
+			"image files (png, jpg, gif, webp, bmp) are returned as image attachments you can see (offset/limit do not apply)",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -650,6 +709,23 @@ var DefaultTools = []Tool{
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return "", err
+			}
+			// Images ride along as multimodal attachments instead of numbered
+			// text; the summary line is all the console (and the onTool report)
+			// ever sees of them. Sniffing happens before the binary check below
+			// because image formats trip it (PNG, GIF, BMP, WebP carry NUL
+			// bytes; a NUL-free JPEG would still sniff here first).
+			if media := sniffImage(data); media != "" {
+				if int64(len(data)) > maxImageBytes {
+					return "", fmt.Errorf("%s: %s image is %d bytes; image attachments are capped at %d bytes",
+						path, media, len(data), maxImageBytes)
+				}
+				summary := fmt.Sprintf("%s: %s image, %d bytes", path, media, len(data))
+				if attach := attachFrom(ctx); attach != nil {
+					attach(ImageAttachment{MediaType: media, Data: data})
+					return summary + " (image attached)", nil
+				}
+				return summary + " (image attachments not supported here)", nil
 			}
 			if bytes.IndexByte(data, 0) >= 0 {
 				return "", fmt.Errorf("%s: binary file", path)
@@ -1579,6 +1655,7 @@ type toolCallResult struct {
 	out      string // result text, or the error text when callErr != nil
 	callErr  error  // non-nil when the handler itself failed
 	displays []string
+	images   []ImageAttachment // images attached by the handler, sent back as content parts
 }
 
 // toolCallMeta extracts the function name and raw arguments string from
@@ -1606,17 +1683,24 @@ func lookupTool(registry map[string]Tool, tci any) Tool {
 }
 
 // runOneToolCall executes a single call from a batch. The handler runs
-// with a per-call display collector in its context instead of the
-// caller's emitter: parallel handlers must not share the emitter (the
-// CLI's callback mutates console state), and buffered previews can be
-// replayed in call order once the batch is done.
+// with per-call display and attachment collectors in its context instead
+// of the caller's emitter: parallel handlers must not share the emitter
+// (the CLI's callback mutates console state), and buffered previews can be
+// replayed in call order once the batch is done. Collected images ride
+// with the result and are encoded into the tool message, never into the
+// console output.
 func runOneToolCall(ctx context.Context, registry map[string]Tool, i int, tci any) toolCallResult {
 	var mu sync.Mutex
 	var displays []string
-	callCtx := WithDisplay(ctx, func(s string) {
+	var images []ImageAttachment
+	callCtx := WithAttachments(WithDisplay(ctx, func(s string) {
 		mu.Lock()
 		defer mu.Unlock()
 		displays = append(displays, s)
+	}), func(img ImageAttachment) {
+		mu.Lock()
+		defer mu.Unlock()
+		images = append(images, img)
 	})
 	callID, out, callErr := handleToolCall(callCtx, registry, i, tci)
 	name, argStr := toolCallMeta(tci)
@@ -1627,6 +1711,36 @@ func runOneToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 		out:      out,
 		callErr:  callErr,
 		displays: displays,
+		images:   images,
+	}
+}
+
+// toolMessage builds the tool message for one result: plain string
+// content normally, or OpenAI-style content parts (text summary plus
+// image_url data URLs) when the call attached images. Keeping the shape
+// decision here confines the wire format to one place, so a provider that
+// rejects parts in tool messages can be handled locally.
+func toolMessage(callID, text string, images []ImageAttachment) map[string]any {
+	text = TruncateUTF8(text, maxToolResultBytes, "\n[...truncated...]")
+	if len(images) == 0 {
+		return map[string]any{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      text,
+		}
+	}
+	parts := make([]any, 0, len(images)+1)
+	parts = append(parts, map[string]any{"type": "text", "text": text})
+	for _, img := range images {
+		parts = append(parts, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": imageDataURL(img)},
+		})
+	}
+	return map[string]any{
+		"role":         "tool",
+		"tool_call_id": callID,
+		"content":      parts,
 	}
 }
 
@@ -1640,7 +1754,9 @@ func runOneToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 // call order regardless of completion order, keeping the history
 // deterministic (tool_call_ids stay paired in sequence) and the console
 // coherent. A handler error is reported as that call's tool message, not
-// a batch failure.
+// a batch failure. A handler that attached images gets them encoded as
+// image_url content parts in its tool message (see toolMessage) while the
+// reported text stays a one-line summary.
 func processToolCalls(
 	ctx context.Context,
 	registry map[string]Tool,
@@ -1678,11 +1794,7 @@ func processToolCalls(
 		if onTool != nil {
 			onTool(r.callID, r.name, r.argStr, r.callErr == nil, r.out)
 		}
-		addMessage(map[string]any{
-			"role":         "tool",
-			"tool_call_id": r.callID,
-			"content":      TruncateUTF8(r.out, maxToolResultBytes, "\n[...truncated...]"),
-		})
+		addMessage(toolMessage(r.callID, r.out, r.images))
 	}
 }
 

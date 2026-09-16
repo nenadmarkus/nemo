@@ -1,8 +1,13 @@
 package nemo
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -599,6 +604,66 @@ func TestProcessToolCallsDisplayReplay(t *testing.T) {
 	}
 }
 
+func TestProcessToolCallsImageAttachment(t *testing.T) {
+	// A call whose handler attaches an image gets content parts
+	// (text + image_url data URL) in its tool message; a text-only
+	// call keeps plain string content.
+	reg := map[string]Tool{
+		"selfie": {Name: "selfie", Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			if attach := attachFrom(ctx); attach != nil {
+				attach(ImageAttachment{MediaType: "image/png", Data: []byte{1, 2, 3}})
+			}
+			return "attached 1 image", nil
+		}},
+		"plain": {Name: "plain", Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			return "text only", nil
+		}},
+	}
+	var msgs []map[string]any
+	processToolCalls(context.Background(), reg, []any{
+		batchCall("c1", "selfie", "{}"),
+		batchCall("c2", "plain", "{}"),
+	},
+		func(callID, name, args string, ok bool, detail string) {},
+		func(msg map[string]any) { msgs = append(msgs, msg) })
+
+	if len(msgs) != 2 {
+		t.Fatalf("got %d tool messages, want 2", len(msgs))
+	}
+
+	// Image call: content is [text part, image_url part] with a data URL.
+	m := msgs[0]
+	if m["role"] != "tool" || m["tool_call_id"] != "c1" {
+		t.Errorf("message role/id = %v/%v, want tool/c1", m["role"], m["tool_call_id"])
+	}
+	parts, ok := m["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %#v, want 2 parts", m["content"])
+	}
+	text, _ := parts[0].(map[string]any)
+	if text["type"] != "text" || text["text"] != "attached 1 image" {
+		t.Errorf("text part = %v, want attached 1 image", text)
+	}
+	ip, _ := parts[1].(map[string]any)
+	if ip["type"] != "image_url" {
+		t.Fatalf("second part type = %v, want image_url", ip["type"])
+	}
+	iu, _ := ip["image_url"].(map[string]any)
+	wantURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte{1, 2, 3})
+	if iu["url"] != wantURL {
+		t.Errorf("image url = %v, want %v", iu["url"], wantURL)
+	}
+	// The parts must survive the wire format.
+	if _, err := json.Marshal(m); err != nil {
+		t.Errorf("marshal tool message with parts: %v", err)
+	}
+
+	// No-image call: content stays a plain string (regression guard).
+	if s, ok := msgs[1]["content"].(string); !ok || s != "text only" {
+		t.Errorf("plain content = %#v, want %q", msgs[1]["content"], "text only")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tool handlers (against temp directories).
 // ---------------------------------------------------------------------------
@@ -702,6 +767,107 @@ func TestReadTool(t *testing.T) {
 	_, err = callTool(t, tool, map[string]any{"path": p, "offset": float64(4)})
 	if err == nil || err.Error() != "offset 4 beyond end of file (3 lines)" {
 		t.Errorf("read (past eof) err = %v, want offset error", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Image attachments (read on image files, multimodal tool results).
+// ---------------------------------------------------------------------------
+
+// pngBytes renders a small real PNG so tests exercise true signatures.
+func pngBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestSniffImage(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"png", pngBytes(t), "image/png"},
+		{"jpeg magic, no extension", append([]byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00}, make([]byte, 32)...), "image/jpeg"},
+		{"webp", append([]byte("RIFF\x00\x00\x00\x00WEBPVP8 "), make([]byte, 16)...), "image/webp"},
+		{"bmp", append([]byte("BM\x00\x00\x00\x00"), make([]byte, 16)...), "image/bmp"},
+		{"text is not an image", []byte("hello world"), ""},
+		{"svg is excluded", []byte("<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>"), ""},
+		{"empty", nil, ""},
+	}
+	for _, tt := range tests {
+		if got := sniffImage(tt.data); got != tt.want {
+			t.Errorf("%s: sniffImage = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestImageDataURL(t *testing.T) {
+	img := ImageAttachment{MediaType: "image/png", Data: []byte{1, 2, 3}}
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(img.Data)
+	if got := imageDataURL(img); got != want {
+		t.Errorf("imageDataURL = %q, want %q", got, want)
+	}
+}
+
+func TestReadImageTool(t *testing.T) {
+	tool := toolByName(t, "read")
+	img := pngBytes(t)
+	p := filepath.Join(t.TempDir(), "shot.png")
+	mustWrite(t, p, string(img))
+
+	// With a collector in the context the image is attached and the tool
+	// returns a one-line summary (no base64 in the result text).
+	var got []ImageAttachment
+	ctx := WithAttachments(context.Background(), func(a ImageAttachment) {
+		got = append(got, a)
+	})
+	out, err := tool.Handler(ctx, map[string]any{"path": p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("%s: image/png image, %d bytes (image attached)", p, len(img))
+	if out != want {
+		t.Errorf("read (image) = %q, want %q", out, want)
+	}
+	if len(got) != 1 || got[0].MediaType != "image/png" || !bytes.Equal(got[0].Data, img) {
+		t.Errorf("attachments = %+v, want one png with the file bytes", got)
+	}
+
+	// Without a collector (handler invoked outside a run), the summary
+	// degrades gracefully instead of failing.
+	out, err = tool.Handler(context.Background(), map[string]any{"path": p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = fmt.Sprintf("%s: image/png image, %d bytes (image attachments not supported here)", p, len(img))
+	if out != want {
+		t.Errorf("read (image, no collector) = %q, want %q", out, want)
+	}
+
+	// A text file with an image extension stays readable as text.
+	fake := filepath.Join(filepath.Dir(p), "fake.png")
+	mustWrite(t, fake, "one\ntwo")
+	out, err = tool.Handler(ctx, map[string]any{"path": fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fake + ": 2 lines, 7 bytes\n1| one\n2| two\n"; out != want {
+		t.Errorf("read (fake.png) = %q, want %q", out, want)
+	}
+}
+
+func TestReadImageTooLarge(t *testing.T) {
+	tool := toolByName(t, "read")
+	big := append(append([]byte{}, pngBytes(t)...), bytes.Repeat([]byte{0}, int(maxImageBytes))...)
+	p := filepath.Join(t.TempDir(), "huge.png")
+	mustWrite(t, p, string(big))
+	_, err := tool.Handler(context.Background(), map[string]any{"path": p})
+	if err == nil || !strings.Contains(err.Error(), "capped at") {
+		t.Errorf("oversized image err = %v, want cap error", err)
 	}
 }
 
@@ -1093,5 +1259,78 @@ func TestBuildRequestBody(t *testing.T) {
 	}
 	if _, ok := body["max_tokens"]; ok {
 		t.Error("max_tokens = 0 should be omitted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Optional network spike: image parts in tool messages (#15).
+// ---------------------------------------------------------------------------
+
+// TestSpikeToolImageTransport checks that the configured endpoint accepts
+// image_url content parts inside a tool message (the #15 wire format) and
+// that the model actually sees the image. It costs one real LLM call, so
+// it is skipped unless opted in:
+//
+//	NEMO_SPIKE=1 OPENROUTER_API_KEY=... go test -run TestSpikeToolImageTransport -v
+//
+// NEMO_SPIKE_MODEL overrides the model (default: a vision-capable one —
+// the default DeepSeek flash model is text-only and will fail).
+func TestSpikeToolImageTransport(t *testing.T) {
+	if os.Getenv("NEMO_SPIKE") != "1" {
+		t.Skip("set NEMO_SPIKE=1 (and OPENROUTER_API_KEY) to run the image-transport spike")
+	}
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		t.Skip("OPENROUTER_API_KEY not set")
+	}
+	model := os.Getenv("NEMO_SPIKE_MODEL")
+	if model == "" {
+		model = "google/gemini-2.5-flash"
+	}
+	img, err := os.ReadFile("table.png")
+	if err != nil {
+		t.Skipf("table.png not readable: %v", err)
+	}
+
+	// A history that looks like a read call on the image just happened.
+	s := NewSession()
+	s.Messages = []map[string]any{
+		{
+			"role": "assistant",
+			"tool_calls": []any{map[string]any{
+				"id":   "c1",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "read",
+					"arguments": `{"path":"table.png"}`,
+				},
+			}},
+		},
+		toolMessage("c1",
+			fmt.Sprintf("table.png: image/png image, %d bytes (image attached)", len(img)),
+			[]ImageAttachment{{MediaType: "image/png", Data: img}}),
+	}
+
+	ag := &Agent{
+		Name:         "spike",
+		Endpoint:     "https://openrouter.ai/api/v1/chat/completions",
+		APIKey:       apiKey,
+		Model:        model,
+		Tools:        DefaultTools,
+		SystemPrompt: SystemPrompt,
+	}
+	var reply strings.Builder
+	err = ag.Run(context.Background(), s,
+		"What does the image returned by the read tool show? Answer in one sentence.",
+		nil,
+		func(c string) { reply.WriteString(c) },
+		func(sys string) { t.Log("[system] " + sys) },
+		nil)
+	if err != nil {
+		t.Fatalf("endpoint rejected image-in-tool-message for %s: %v", model, err)
+	}
+	t.Logf("%s reply: %s", model, reply.String())
+	if reply.Len() == 0 {
+		t.Fatal("empty reply")
 	}
 }
