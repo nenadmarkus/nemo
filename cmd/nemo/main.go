@@ -1,39 +1,216 @@
 // Command nemo is a turn-based terminal coding assistant built on the
 // nemo agent library: it reads prompts, streams the model's reasoning,
 // output, and tool activity, and applies the workspace tools in the
-// current directory. Ctrl+C aborts the running turn; "exit" or Ctrl-D
-// quits.
+// current directory. Model and endpoint come from a flat JSON config
+// file (-config path, ./.nemo/config.json, or ~/.nemo/config.json),
+// falling back to OpenRouter defaults with $OPENROUTER_API_KEY. Ctrl+C
+// aborts the running turn; "exit" or Ctrl-D quits.
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
 	"nemo"
 )
 
-func main() {
+// ---------------------------------------------------------------------------
+// Configuration.
+// ---------------------------------------------------------------------------
 
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: OPENROUTER_API_KEY not set")
-		return
+// config is the parsed contents of a nemo JSON config file. Every field
+// is optional; unset fields keep their defaults, and a base_url without
+// an explicit provider drops the OpenRouter-specific routing hints.
+type config struct {
+	BaseURL     string         `json:"base_url"`    // e.g. "https://api.openai.com/v1"
+	Model       string         `json:"model"`
+	APIKey      string         `json:"api_key"`
+	Provider    map[string]any `json:"provider"`    // OpenRouter routing hints
+	Temperature *float64       `json:"temperature"` // nil = provider default
+	MaxTokens   int            `json:"max_tokens"`  // 0 = provider default
+}
+
+// Zero-config defaults: OpenRouter with the DeepSeek flash model.
+const (
+	defaultBaseURL = "https://openrouter.ai/api/v1/chat/completions"
+	defaultModel   = "deepseek/deepseek-v4-flash-0731"
+)
+
+var defaultProvider = map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true}
+
+// defaults returns the zero-config configuration.
+func defaults() config {
+	return config{BaseURL: defaultBaseURL, Model: defaultModel, Provider: defaultProvider}
+}
+
+// configSearchPaths lists the implicit config locations in precedence
+// order: the workspace's .nemo/config.json, then the user-level one.
+func configSearchPaths() []string {
+	paths := []string{filepath.Join(".nemo", "config.json")}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".nemo", "config.json"))
 	}
+	return paths
+}
 
-	root := &nemo.Agent{
+// fileExists reports whether path is a regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// loadConfig reads and parses a JSON config file; errors name the file so
+// a bad config is loud and actionable.
+func loadConfig(path string) (config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return config{}, fmt.Errorf("config %s: %w", path, err)
+	}
+	var cfg config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return config{}, fmt.Errorf("config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// mergeConfig overlays the fields cfg sets onto base and returns the
+// result. Provider routing hints are endpoint-specific: pointing base_url
+// elsewhere without naming providers drops the default OpenRouter hints.
+func mergeConfig(base, cfg config) config {
+	if cfg.BaseURL != "" {
+		base.BaseURL = cfg.BaseURL
+		if cfg.Provider == nil {
+			base.Provider = nil
+		}
+	}
+	if cfg.Model != "" {
+		base.Model = cfg.Model
+	}
+	if cfg.APIKey != "" {
+		base.APIKey = cfg.APIKey
+	}
+	if cfg.Provider != nil {
+		base.Provider = cfg.Provider
+	}
+	if cfg.Temperature != nil {
+		base.Temperature = cfg.Temperature
+	}
+	if cfg.MaxTokens > 0 {
+		base.MaxTokens = cfg.MaxTokens
+	}
+	return base
+}
+
+// resolveConfig finds and loads the configuration. An explicit -config
+// path is used as given (a missing or malformed file is an error);
+// otherwise the first existing search path wins. The returned source
+// labels where the configuration came from ("defaults" or a path).
+func resolveConfig(flagPath string) (cfg config, source string, err error) {
+	paths := []string{flagPath}
+	if flagPath == "" {
+		paths = configSearchPaths()
+	}
+	for _, p := range paths {
+		if flagPath == "" && !fileExists(p) {
+			continue
+		}
+		loaded, err := loadConfig(p)
+		if err != nil {
+			return config{}, "", err
+		}
+		return mergeConfig(defaults(), loaded), p, nil
+	}
+	return defaults(), "defaults", nil
+}
+
+// normalizeChatURL turns an OpenAI-compatible base URL (e.g.
+// "https://api.openai.com/v1") into a chat-completions endpoint by
+// appending /chat/completions when missing; an already-complete endpoint
+// passes through (trailing slashes tolerated), and non-http(s) URLs are
+// rejected.
+func normalizeChatURL(base string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("base_url %q: %w", base, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("base_url %q: only http/https are supported", base)
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	if !strings.HasSuffix(p, "/chat/completions") {
+		p += "/chat/completions"
+	}
+	u.Path = p
+	return u.String(), nil
+}
+
+// isLocalhostURL reports whether the endpoint points at the local host,
+// where API keys are usually unnecessary (Ollama, LM Studio).
+func isLocalhostURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+// buildAgent assembles the root agent from a resolved config; all model
+// and endpoint data enters the library through Agent fields.
+func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
+	return &nemo.Agent{
 		Name:         "root",
-		Endpoint:     "https://openrouter.ai/api/v1/chat/completions",
+		Endpoint:     endpoint,
 		APIKey:       apiKey,
-		Model:        "deepseek/deepseek-v4-flash-0731",
+		Model:        cfg.Model,
 		Tools:        nemo.DefaultTools,
-		Provider:     map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true},
+		Provider:     cfg.Provider,
+		Temperature:  cfg.Temperature,
+		MaxTokens:    cfg.MaxTokens,
 		SystemPrompt: nemo.ProjectPrompt(nemo.GroundedPrompt(nemo.SystemPrompt), "."),
 	}
+}
+
+func main() {
+	configPath := flag.String("config", "", "path to a JSON config file (default: ./.nemo/config.json, then ~/.nemo/config.json)")
+	flag.Parse()
+
+	cfg, source, err := resolveConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	endpoint, err := normalizeChatURL(cfg.BaseURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+
+	// Key resolution: a config api_key wins over the OPENROUTER_API_KEY
+	// environment variable; local endpoints run keyless.
+	apiKey := cfg.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENROUTER_API_KEY")
+	}
+	if apiKey == "" && !isLocalhostURL(endpoint) {
+		fmt.Fprintf(os.Stderr, "error: no API key: set \"api_key\" in %s or export OPENROUTER_API_KEY\n", source)
+		os.Exit(1)
+	}
+
+	root := buildAgent(cfg, apiKey, endpoint)
 
 	// Stream callbacks: render reasoning/output/tool/system blocks, each
 	// starting on a fresh line with its own header so phases are unmistakable.
@@ -137,6 +314,7 @@ func main() {
 	s := nemo.NewSession()
 
 	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
+	fmt.Printf("nemo: config=%s model=%s base=%s\n", source, root.Model, root.Endpoint)
 
 	// Signals: Ctrl-C/SIGTERM during a run cancels just that turn; at the
 	// prompt it discards the pending line (the tty does that anyway) and a

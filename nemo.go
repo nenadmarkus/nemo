@@ -1709,8 +1709,33 @@ type Agent struct {
 	Model             string
 	Tools             []Tool
 	Provider          map[string]any // nil = omit from the request
+	Temperature       *float64       // nil = omit from the request
+	MaxTokens         int            // 0 = omit from the request
 	MaxToolIterations int            // 0 = default
 	SystemPrompt      string
+}
+
+// buildRequestBody assembles the chat-completions request payload from the
+// agent's static configuration: model, history, and tool specs are always
+// present, while optional knobs (provider routing hints, temperature,
+// max_tokens) ride along only when set.
+func buildRequestBody(ag *Agent, messages []map[string]any, specs []map[string]any) map[string]any {
+	reqBody := map[string]any{
+		"model":       ag.Model,
+		"messages":    messages,
+		"tools":       specs,
+		"tool_choice": "auto",
+	}
+	if ag.Provider != nil {
+		reqBody["provider"] = ag.Provider
+	}
+	if ag.Temperature != nil {
+		reqBody["temperature"] = *ag.Temperature
+	}
+	if ag.MaxTokens > 0 {
+		reqBody["max_tokens"] = ag.MaxTokens
+	}
+	return reqBody
 }
 
 // Run appends the user's message to the session, streams the assistant reply
@@ -1764,15 +1789,7 @@ func (ag *Agent) Run(
 			return err
 		}
 
-		reqBody := map[string]any{
-			"model":       ag.Model,
-			"messages":    s.Messages,
-			"tools":       specs,
-			"tool_choice": "auto",
-		}
-		if ag.Provider != nil {
-			reqBody["provider"] = ag.Provider
-		}
+		reqBody := buildRequestBody(ag, s.Messages, specs)
 
 		// Stream the assistant reply through the caller's callbacks.
 		res, err := llmCallStream(ctx, ag.Endpoint, ag.APIKey, reqBody, onReasoning, onContent, onSystem)

@@ -1038,3 +1038,60 @@ func TestProjectPrompt(t *testing.T) {
 		t.Errorf("ProjectPrompt should end with the instructions, got tail %q", got[len(got)-80:])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// buildRequestBody (Agent request assembly).
+// ---------------------------------------------------------------------------
+
+// TestBuildRequestBody pins that optional request knobs ride along only
+// when set, so a zero-config agent produces the same payload as before
+// temperature/max_tokens existed.
+func TestBuildRequestBody(t *testing.T) {
+	temp := 0.7
+	zero := 0.0
+	msgs := []map[string]any{{"role": "user", "content": "hi"}}
+	specs := []map[string]any{{"type": "function"}}
+
+	// Minimal agent: base fields present, optional fields omitted.
+	body := buildRequestBody(&Agent{Model: "m"}, msgs, specs)
+	for _, k := range []string{"model", "messages", "tools", "tool_choice"} {
+		if _, ok := body[k]; !ok {
+			t.Errorf("minimal agent: %s missing from request body", k)
+		}
+	}
+	for _, k := range []string{"provider", "temperature", "max_tokens"} {
+		if _, ok := body[k]; ok {
+			t.Errorf("minimal agent: %s should be omitted", k)
+		}
+	}
+	if body["model"] != "m" || body["tool_choice"] != "auto" {
+		t.Errorf("minimal agent: got %#v", body)
+	}
+
+	// Everything set: values pass through verbatim.
+	body = buildRequestBody(&Agent{
+		Model:       "m",
+		Provider:    map[string]any{"order": []string{"DeepSeek"}},
+		Temperature: &temp,
+		MaxTokens:   4096,
+	}, msgs, specs)
+	if _, ok := body["provider"]; !ok {
+		t.Error("provider set: missing from request body")
+	}
+	if got, ok := body["temperature"].(float64); !ok || got != temp {
+		t.Errorf("temperature set: got %#v, want %v", body["temperature"], temp)
+	}
+	if got, ok := body["max_tokens"].(int); !ok || got != 4096 {
+		t.Errorf("max_tokens set: got %#v, want 4096", body["max_tokens"])
+	}
+
+	// A zero temperature is an explicit request (nil is the unset case);
+	// zero max_tokens still means "unset", not a request for no tokens.
+	body = buildRequestBody(&Agent{Model: "m", Temperature: &zero, MaxTokens: 0}, msgs, specs)
+	if got, ok := body["temperature"].(float64); !ok || got != 0 {
+		t.Errorf("temperature 0 should still be sent, got %#v", body["temperature"])
+	}
+	if _, ok := body["max_tokens"]; ok {
+		t.Error("max_tokens = 0 should be omitted")
+	}
+}
