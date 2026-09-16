@@ -380,28 +380,40 @@ func displayFrom(ctx context.Context) func(string) {
 	return f
 }
 
-// ImageAttachment is one image riding with a tool result, sent to the
-// model as a multimodal image_url content part.
-type ImageAttachment struct {
-	MediaType string // MIME type, e.g. "image/png"
-	Data      []byte // raw image bytes; base64-encoded once, at message-build time
-}
-
 // attachmentKey keys the attachment collector carried in the run context;
-// the read tool uses it to hand images to processToolCalls without
+// the read tool uses it to hand image URLs to processToolCalls without
 // changing the Tool handler signature — the same trick as the display
 // emitter.
 type attachmentKey struct{}
 
 // WithAttachments returns a context carrying sink as the attachment
-// collector.
-func WithAttachments(ctx context.Context, sink func(ImageAttachment)) context.Context {
+// collector: handlers call it with an image URL that processToolCalls
+// encodes into the tool message as an image_url content part.
+func WithAttachments(ctx context.Context, sink func(imageURL string)) context.Context {
 	return context.WithValue(ctx, attachmentKey{}, sink)
 }
 
 // attachFrom returns the attachment collector in ctx, or nil when absent.
-func attachFrom(ctx context.Context) func(ImageAttachment) {
-	f, _ := ctx.Value(attachmentKey{}).(func(ImageAttachment))
+func attachFrom(ctx context.Context) func(string) {
+	f, _ := ctx.Value(attachmentKey{}).(func(string))
+	return f
+}
+
+// imageURLKey keys the image-transport resolver carried in the run
+// context; Agent.Run installs it from Agent.ImageURL so tool handlers can
+// turn an image path into a URL the model can see.
+type imageURLKey struct{}
+
+// WithImageURL returns a context carrying resolve as the image-transport
+// resolver.
+func WithImageURL(ctx context.Context, resolve func(ctx context.Context, path string) (string, error)) context.Context {
+	return context.WithValue(ctx, imageURLKey{}, resolve)
+}
+
+// imageURLFrom returns the image-transport resolver in ctx, or nil when
+// absent (image attachments disabled).
+func imageURLFrom(ctx context.Context) func(context.Context, string) (string, error) {
+	f, _ := ctx.Value(imageURLKey{}).(func(context.Context, string) (string, error))
 	return f
 }
 
@@ -427,9 +439,27 @@ func sniffImage(data []byte) string {
 	return ""
 }
 
-// imageDataURL renders img as a data: URL for an image_url content part.
-func imageDataURL(img ImageAttachment) string {
-	return "data:" + img.MediaType + ";base64," + base64.StdEncoding.EncodeToString(img.Data)
+// DefaultImageURL is the built-in image transport: read the file, sniff
+// the media type, enforce maxImageBytes, and return a base64 data: URL
+// for an image_url content part. It is never installed implicitly — wire
+// it via Agent.ImageURL (cmd/nemo does) or replace it with a custom
+// transport, e.g. one that uploads the file and returns a hosted link
+// (prefer long-lived links: tool messages persist in the session history
+// and are re-sent every turn).
+func DefaultImageURL(ctx context.Context, path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	media := sniffImage(data)
+	if media == "" {
+		return "", fmt.Errorf("%s: not a supported image (png, jpg, gif, webp, bmp)", path)
+	}
+	if int64(len(data)) > maxImageBytes {
+		return "", fmt.Errorf("%s: %s image is %d bytes; image attachments are capped at %d bytes",
+			path, media, len(data), maxImageBytes)
+	}
+	return "data:" + media + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
 // diffOp is one rendered diff line: ' ' context, '-' removed, '+' added.
@@ -714,18 +744,26 @@ var DefaultTools = []Tool{
 			// text; the summary line is all the console (and the onTool report)
 			// ever sees of them. Sniffing happens before the binary check below
 			// because image formats trip it (PNG, GIF, BMP, WebP carry NUL
-			// bytes; a NUL-free JPEG would still sniff here first).
+			// bytes; a NUL-free JPEG would still sniff here first). The URL
+			// comes from the run's injected transport (Agent.ImageURL): the
+			// built-in base64 data URL or e.g. an upload returning a link.
 			if media := sniffImage(data); media != "" {
 				if int64(len(data)) > maxImageBytes {
 					return "", fmt.Errorf("%s: %s image is %d bytes; image attachments are capped at %d bytes",
 						path, media, len(data), maxImageBytes)
 				}
 				summary := fmt.Sprintf("%s: %s image, %d bytes", path, media, len(data))
-				if attach := attachFrom(ctx); attach != nil {
-					attach(ImageAttachment{MediaType: media, Data: data})
-					return summary + " (image attached)", nil
+				resolve := imageURLFrom(ctx)
+				attach := attachFrom(ctx)
+				if resolve == nil || attach == nil {
+					return summary + " (image attachments not supported here)", nil
 				}
-				return summary + " (image attachments not supported here)", nil
+				url, err := resolve(ctx, path)
+				if err != nil {
+					return "", fmt.Errorf("image transport failed for %s: %w", path, err)
+				}
+				attach(url)
+				return summary + " (image attached)", nil
 			}
 			if bytes.IndexByte(data, 0) >= 0 {
 				return "", fmt.Errorf("%s: binary file", path)
@@ -1655,7 +1693,7 @@ type toolCallResult struct {
 	out      string // result text, or the error text when callErr != nil
 	callErr  error  // non-nil when the handler itself failed
 	displays []string
-	images   []ImageAttachment // images attached by the handler, sent back as content parts
+	images   []string // image URLs attached by the handler, sent back as content parts
 }
 
 // toolCallMeta extracts the function name and raw arguments string from
@@ -1686,21 +1724,21 @@ func lookupTool(registry map[string]Tool, tci any) Tool {
 // with per-call display and attachment collectors in its context instead
 // of the caller's emitter: parallel handlers must not share the emitter
 // (the CLI's callback mutates console state), and buffered previews can be
-// replayed in call order once the batch is done. Collected images ride
-// with the result and are encoded into the tool message, never into the
-// console output.
+// replayed in call order once the batch is done. Collected image URLs
+// ride with the result into the tool message, never into the console
+// output.
 func runOneToolCall(ctx context.Context, registry map[string]Tool, i int, tci any) toolCallResult {
 	var mu sync.Mutex
 	var displays []string
-	var images []ImageAttachment
+	var images []string
 	callCtx := WithAttachments(WithDisplay(ctx, func(s string) {
 		mu.Lock()
 		defer mu.Unlock()
 		displays = append(displays, s)
-	}), func(img ImageAttachment) {
+	}), func(url string) {
 		mu.Lock()
 		defer mu.Unlock()
-		images = append(images, img)
+		images = append(images, url)
 	})
 	callID, out, callErr := handleToolCall(callCtx, registry, i, tci)
 	name, argStr := toolCallMeta(tci)
@@ -1717,24 +1755,27 @@ func runOneToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 
 // toolMessage builds the tool message for one result: plain string
 // content normally, or OpenAI-style content parts (text summary plus
-// image_url data URLs) when the call attached images. Keeping the shape
-// decision here confines the wire format to one place, so a provider that
-// rejects parts in tool messages can be handled locally.
-func toolMessage(callID, text string, images []ImageAttachment) map[string]any {
+// image_url parts) when the call attached images. The URLs pass through
+// verbatim — a base64 data: URL from the built-in transport or an https:
+// link from a custom one (providers fetch remote links themselves).
+// Keeping the shape decision here confines the wire format to one place,
+// so a provider that rejects parts in tool messages can be handled
+// locally.
+func toolMessage(callID, text string, imageURLs []string) map[string]any {
 	text = TruncateUTF8(text, maxToolResultBytes, "\n[...truncated...]")
-	if len(images) == 0 {
+	if len(imageURLs) == 0 {
 		return map[string]any{
 			"role":         "tool",
 			"tool_call_id": callID,
 			"content":      text,
 		}
 	}
-	parts := make([]any, 0, len(images)+1)
+	parts := make([]any, 0, len(imageURLs)+1)
 	parts = append(parts, map[string]any{"type": "text", "text": text})
-	for _, img := range images {
+	for _, url := range imageURLs {
 		parts = append(parts, map[string]any{
 			"type":      "image_url",
-			"image_url": map[string]any{"url": imageDataURL(img)},
+			"image_url": map[string]any{"url": url},
 		})
 	}
 	return map[string]any{
@@ -1825,6 +1866,11 @@ type Agent struct {
 	MaxTokens         int            // 0 = omit from the request
 	MaxToolIterations int            // 0 = default
 	SystemPrompt      string
+	// ImageURL turns an image file into a URL the model can see in an
+	// image_url content part: the built-in DefaultImageURL (base64 data
+	// URL) or e.g. an upload that returns a hosted link. nil = read
+	// reports images as text-only summaries (attachments disabled).
+	ImageURL func(ctx context.Context, path string) (string, error)
 }
 
 // buildRequestBody assembles the chat-completions request payload from the
@@ -1868,6 +1914,12 @@ func (ag *Agent) Run(
 
 	addMessage := func(msg map[string]any) {
 		s.Messages = append(s.Messages, msg)
+	}
+
+	// The image transport (when configured) rides in the context so tool
+	// handlers can resolve image paths to URLs the model can see.
+	if ag.ImageURL != nil {
+		ctx = WithImageURL(ctx, ag.ImageURL)
 	}
 
 	if len(s.Messages) == 0 && ag.SystemPrompt != "" {

@@ -180,6 +180,7 @@ func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
 		Temperature:  cfg.Temperature,
 		MaxTokens:    cfg.MaxTokens,
 		SystemPrompt: nemo.ProjectPrompt(nemo.GroundedPrompt(nemo.SystemPrompt), "."),
+		ImageURL:     nemo.DefaultImageURL,
 	}
 }
 

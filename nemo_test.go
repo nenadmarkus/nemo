@@ -605,13 +605,14 @@ func TestProcessToolCallsDisplayReplay(t *testing.T) {
 }
 
 func TestProcessToolCallsImageAttachment(t *testing.T) {
-	// A call whose handler attaches an image gets content parts
-	// (text + image_url data URL) in its tool message; a text-only
-	// call keeps plain string content.
+	// A call whose handler attaches an image URL gets content parts
+	// (text + image_url) in its tool message, with the URL verbatim — the
+	// transport (data: URL or hosted link) already ran in the handler; a
+	// text-only call keeps plain string content.
 	reg := map[string]Tool{
 		"selfie": {Name: "selfie", Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			if attach := attachFrom(ctx); attach != nil {
-				attach(ImageAttachment{MediaType: "image/png", Data: []byte{1, 2, 3}})
+				attach("https://example.com/shot.png")
 			}
 			return "attached 1 image", nil
 		}},
@@ -631,7 +632,7 @@ func TestProcessToolCallsImageAttachment(t *testing.T) {
 		t.Fatalf("got %d tool messages, want 2", len(msgs))
 	}
 
-	// Image call: content is [text part, image_url part] with a data URL.
+	// Image call: content is [text part, image_url part] with the URL verbatim.
 	m := msgs[0]
 	if m["role"] != "tool" || m["tool_call_id"] != "c1" {
 		t.Errorf("message role/id = %v/%v, want tool/c1", m["role"], m["tool_call_id"])
@@ -649,9 +650,8 @@ func TestProcessToolCallsImageAttachment(t *testing.T) {
 		t.Fatalf("second part type = %v, want image_url", ip["type"])
 	}
 	iu, _ := ip["image_url"].(map[string]any)
-	wantURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte{1, 2, 3})
-	if iu["url"] != wantURL {
-		t.Errorf("image url = %v, want %v", iu["url"], wantURL)
+	if iu["url"] != "https://example.com/shot.png" {
+		t.Errorf("image url = %v, want https://example.com/shot.png", iu["url"])
 	}
 	// The parts must survive the wire format.
 	if _, err := json.Marshal(m); err != nil {
@@ -805,11 +805,38 @@ func TestSniffImage(t *testing.T) {
 	}
 }
 
-func TestImageDataURL(t *testing.T) {
-	img := ImageAttachment{MediaType: "image/png", Data: []byte{1, 2, 3}}
-	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(img.Data)
-	if got := imageDataURL(img); got != want {
-		t.Errorf("imageDataURL = %q, want %q", got, want)
+func TestDefaultImageURL(t *testing.T) {
+	dir := t.TempDir()
+	img := pngBytes(t)
+
+	// A real PNG round-trips into a decodable data: URL.
+	p := filepath.Join(dir, "shot.png")
+	mustWrite(t, p, string(img))
+	url, err := DefaultImageURL(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(url, prefix) {
+		t.Fatalf("url = %q, want %q prefix", url, prefix)
+	}
+	if dec, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(url, prefix)); err != nil || !bytes.Equal(dec, img) {
+		t.Errorf("decoded payload does not match file bytes (err %v)", err)
+	}
+
+	// Unsupported content (text named .png) errors instead of encoding garbage.
+	txt := filepath.Join(dir, "fake.png")
+	mustWrite(t, txt, "one\ntwo")
+	if _, err := DefaultImageURL(context.Background(), txt); err == nil || !strings.Contains(err.Error(), "not a supported image") {
+		t.Errorf("text file err = %v, want unsupported-image error", err)
+	}
+
+	// The size cap applies.
+	big := append(append([]byte{}, img...), bytes.Repeat([]byte{0}, int(maxImageBytes))...)
+	huge := filepath.Join(dir, "huge.png")
+	mustWrite(t, huge, string(big))
+	if _, err := DefaultImageURL(context.Background(), huge); err == nil || !strings.Contains(err.Error(), "capped at") {
+		t.Errorf("oversized err = %v, want cap error", err)
 	}
 }
 
@@ -819,11 +846,14 @@ func TestReadImageTool(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "shot.png")
 	mustWrite(t, p, string(img))
 
-	// With a collector in the context the image is attached and the tool
-	// returns a one-line summary (no base64 in the result text).
-	var got []ImageAttachment
-	ctx := WithAttachments(context.Background(), func(a ImageAttachment) {
-		got = append(got, a)
+	// Fully wired context: transport resolver + attachment collector. The
+	// resolver's URL is attached verbatim; the result text stays a
+	// one-line summary (no URL or base64 in it).
+	var got []string
+	ctx := WithImageURL(WithAttachments(context.Background(), func(u string) {
+		got = append(got, u)
+	}), func(ctx context.Context, path string) (string, error) {
+		return "https://example.com/" + filepath.Base(path), nil
 	})
 	out, err := tool.Handler(ctx, map[string]any{"path": p})
 	if err != nil {
@@ -833,11 +863,11 @@ func TestReadImageTool(t *testing.T) {
 	if out != want {
 		t.Errorf("read (image) = %q, want %q", out, want)
 	}
-	if len(got) != 1 || got[0].MediaType != "image/png" || !bytes.Equal(got[0].Data, img) {
-		t.Errorf("attachments = %+v, want one png with the file bytes", got)
+	if want := []string{"https://example.com/shot.png"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("attachments = %v, want %v", got, want)
 	}
 
-	// Without a collector (handler invoked outside a run), the summary
+	// No transport installed (handler invoked outside a run): the summary
 	// degrades gracefully instead of failing.
 	out, err = tool.Handler(context.Background(), map[string]any{"path": p})
 	if err != nil {
@@ -845,13 +875,24 @@ func TestReadImageTool(t *testing.T) {
 	}
 	want = fmt.Sprintf("%s: image/png image, %d bytes (image attachments not supported here)", p, len(img))
 	if out != want {
-		t.Errorf("read (image, no collector) = %q, want %q", out, want)
+		t.Errorf("read (image, no transport) = %q, want %q", out, want)
+	}
+
+	// A failing transport surfaces its error to the model and attaches nothing.
+	failCtx := WithImageURL(WithAttachments(context.Background(), func(u string) {
+		t.Error("collector called despite transport failure")
+	}), func(ctx context.Context, path string) (string, error) {
+		return "", fmt.Errorf("s3 put failed")
+	})
+	if _, err := tool.Handler(failCtx, map[string]any{"path": p}); err == nil || !strings.Contains(err.Error(), "image transport failed") {
+		t.Errorf("transport failure err = %v, want image transport failed", err)
 	}
 
 	// A text file with an image extension stays readable as text.
 	fake := filepath.Join(filepath.Dir(p), "fake.png")
 	mustWrite(t, fake, "one\ntwo")
-	out, err = tool.Handler(ctx, map[string]any{"path": fake})
+	textCtx := WithAttachments(context.Background(), func(u string) {})
+	out, err = tool.Handler(textCtx, map[string]any{"path": fake})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1287,9 +1328,9 @@ func TestSpikeToolImageTransport(t *testing.T) {
 	if model == "" {
 		model = "google/gemini-2.5-flash"
 	}
-	img, err := os.ReadFile("table.png")
+	imgURL, err := DefaultImageURL(context.Background(), "table.png")
 	if err != nil {
-		t.Skipf("table.png not readable: %v", err)
+		t.Skipf("table.png not usable: %v", err)
 	}
 
 	// A history that looks like a read call on the image just happened.
@@ -1306,9 +1347,7 @@ func TestSpikeToolImageTransport(t *testing.T) {
 				},
 			}},
 		},
-		toolMessage("c1",
-			fmt.Sprintf("table.png: image/png image, %d bytes (image attached)", len(img)),
-			[]ImageAttachment{{MediaType: "image/png", Data: img}}),
+		toolMessage("c1", "table.png: image attached", []string{imgURL}),
 	}
 
 	ag := &Agent{
@@ -1318,6 +1357,7 @@ func TestSpikeToolImageTransport(t *testing.T) {
 		Model:        model,
 		Tools:        DefaultTools,
 		SystemPrompt: SystemPrompt,
+		ImageURL:     DefaultImageURL,
 	}
 	var reply strings.Builder
 	err = ag.Run(context.Background(), s,
