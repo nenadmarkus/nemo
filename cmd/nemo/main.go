@@ -9,16 +9,27 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/deepteams/webp"
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/webp"
 
 	"nemo"
 )
@@ -180,8 +191,63 @@ func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
 		Temperature:  cfg.Temperature,
 		MaxTokens:    cfg.MaxTokens,
 		SystemPrompt: nemo.ProjectPrompt(nemo.GroundedPrompt(nemo.SystemPrompt), "."),
-		ImageURL:     nemo.DefaultImageURL,
+		// Smart transport instead of nemo.DefaultImageURL: resize + WebP.
+		ImageURL: webpImageURL,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Image transport: resize + WebP re-encode.
+// ---------------------------------------------------------------------------
+
+// maxImageDimension caps the longest side of an attached image; vision
+// models charge by area/tile, so a ≤2000px WebP keeps attachments cheap
+// while staying readable.
+const maxImageDimension = 2000
+
+// webpImageURL is the CLI's image transport (Agent.ImageURL): decode any
+// image SniffImage admits (blank imports above register the decoders,
+// webp and bmp included), downscale to maxImageDimension on the longest
+// side, and re-encode as lossy WebP (quality 80, method 4) via
+// deepteams/webp — a 4 MiB phone photo becomes a few hundred KB data:
+// URL. Caveats: animated GIFs contribute their first frame only, animated
+// WebP input fails at decode, and EXIF rotation is not applied. ctx is
+// part of the transport signature but unused: decode/encode are
+// CPU-bound and quick at these sizes.
+func webpImageURL(ctx context.Context, path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if nemo.SniffImage(data) == "" {
+		return "", fmt.Errorf("%s: not a supported image (png, jpg, gif, webp, bmp)", path)
+	}
+
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("%s: decode image: %w", path, err)
+	}
+
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w > maxImageDimension || h > maxImageDimension {
+		scale := float64(maxImageDimension) / float64(max(w, h))
+		dst := image.NewRGBA(image.Rect(0, 0,
+			int(float64(w)*scale), int(float64(h)*scale)))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
+		src = dst
+	}
+
+	var out bytes.Buffer
+	if err := webp.Encode(&out, src, &webp.EncoderOptions{
+		Quality: 80,
+		Method:  4,
+	}); err != nil {
+		return "", fmt.Errorf("%s: encode webp: %w", path, err)
+	}
+
+	return "data:image/webp;base64," +
+		base64.StdEncoding.EncodeToString(out.Bytes()), nil
 }
 
 func main() {

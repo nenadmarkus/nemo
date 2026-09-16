@@ -427,11 +427,12 @@ var imageMediaTypes = map[string]bool{
 	"image/bmp":  true,
 }
 
-// sniffImage returns the media type when data begins with a supported
+// SniffImage returns the media type when data begins with a supported
 // raster image signature, "" otherwise. Sniffing the actual bytes (rather
 // than trusting the extension) keeps a text file named .png readable as
-// text and catches extension-less images.
-func sniffImage(data []byte) string {
+// text and catches extension-less images. Exported so custom transports
+// (Agent.ImageURL) can apply the same admission check.
+func SniffImage(data []byte) string {
 	ct := http.DetectContentType(data) // considers at most the first 512 bytes
 	if imageMediaTypes[ct] {
 		return ct
@@ -451,7 +452,7 @@ func DefaultImageURL(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	media := sniffImage(data)
+	media := SniffImage(data)
 	if media == "" {
 		return "", fmt.Errorf("%s: not a supported image (png, jpg, gif, webp, bmp)", path)
 	}
@@ -747,7 +748,7 @@ var DefaultTools = []Tool{
 			// bytes; a NUL-free JPEG would still sniff here first). The URL
 			// comes from the run's injected transport (Agent.ImageURL): the
 			// built-in base64 data URL or e.g. an upload returning a link.
-			if media := sniffImage(data); media != "" {
+			if media := SniffImage(data); media != "" {
 				if int64(len(data)) > maxImageBytes {
 					return "", fmt.Errorf("%s: %s image is %d bytes; image attachments are capped at %d bytes",
 						path, media, len(data), maxImageBytes)

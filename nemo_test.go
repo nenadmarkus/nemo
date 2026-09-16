@@ -799,8 +799,8 @@ func TestSniffImage(t *testing.T) {
 		{"empty", nil, ""},
 	}
 	for _, tt := range tests {
-		if got := sniffImage(tt.data); got != tt.want {
-			t.Errorf("%s: sniffImage = %q, want %q", tt.name, got, tt.want)
+		if got := SniffImage(tt.data); got != tt.want {
+			t.Errorf("%s: SniffImage = %q, want %q", tt.name, got, tt.want)
 		}
 	}
 }
