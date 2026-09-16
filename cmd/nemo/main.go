@@ -31,7 +31,7 @@ import (
 // is optional; unset fields keep their defaults, and a base_url without
 // an explicit provider drops the OpenRouter-specific routing hints.
 type config struct {
-	BaseURL     string         `json:"base_url"`    // e.g. "https://api.openai.com/v1"
+	BaseURL     string         `json:"base_url"` // e.g. "https://api.openai.com/v1"
 	Model       string         `json:"model"`
 	APIKey      string         `json:"api_key"`
 	Provider    map[string]any `json:"provider"`    // OpenRouter routing hints
@@ -42,7 +42,7 @@ type config struct {
 // Zero-config defaults: OpenRouter with the DeepSeek flash model.
 const (
 	defaultBaseURL = "https://openrouter.ai/api/v1/chat/completions"
-	defaultModel   = "deepseek/deepseek-v4-flash-0731"
+	defaultModel   = "deepseek/deepseek-v4.1-flash"
 )
 
 var defaultProvider = map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true}
