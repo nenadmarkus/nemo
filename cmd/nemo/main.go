@@ -95,7 +95,7 @@ func webpImageURL(ctx context.Context, path string) (string, error) {
 
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
-	const maxImageDimension = 2048
+	const maxImageDimension = 2000
 	if w > maxImageDimension || h > maxImageDimension {
 		scale := float64(maxImageDimension) / float64(max(w, h))
 		dst := image.NewRGBA(image.Rect(0, 0,
