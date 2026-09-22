@@ -138,7 +138,7 @@ const SystemPrompt = "You are an expert coding assistant operating inside `nemo`
 func GroundedPrompt(base string) string {
 	cwd, err := os.Getwd()
 	if err != nil {
-	cwd = fmt.Sprintf("(unknown: %v)", err)
+		cwd = fmt.Sprintf("(unknown: %v)", err)
 	}
 	return base +
 		"\n\nCurrent working directory: " + cwd +
@@ -399,23 +399,8 @@ func attachFrom(ctx context.Context) func(string) {
 	return f
 }
 
-// imageURLKey keys the image-transport resolver carried in the run
-// context; Agent.Run installs it from Agent.ImageURL so tool handlers can
-// turn an image path into a URL the model can see.
-type imageURLKey struct{}
-
-// WithImageURL returns a context carrying resolve as the image-transport
-// resolver.
-func WithImageURL(ctx context.Context, resolve func(ctx context.Context, path string) (string, error)) context.Context {
-	return context.WithValue(ctx, imageURLKey{}, resolve)
-}
-
-// imageURLFrom returns the image-transport resolver in ctx, or nil when
-// absent (image attachments disabled).
-func imageURLFrom(ctx context.Context) func(context.Context, string) (string, error) {
-	f, _ := ctx.Value(imageURLKey{}).(func(context.Context, string) (string, error))
-	return f
-}
+// ImageTransport turns an image file into a URL the model can see
+type ImageTransport func(ctx context.Context, path string) (string, error)
 
 // imageMediaTypes are the raster formats providers accept as vision
 // input; SVG is deliberately excluded (no provider renders it).
@@ -430,8 +415,8 @@ var imageMediaTypes = map[string]bool{
 // SniffImage returns the media type when data begins with a supported
 // raster image signature, "" otherwise. Sniffing the actual bytes (rather
 // than trusting the extension) keeps a text file named .png readable as
-// text and catches extension-less images. Exported so custom transports
-// (Agent.ImageURL) can apply the same admission check.
+// text and catches extension-less images. Exported so custom
+// ImageTransport implementations can apply the same admission check.
 func SniffImage(data []byte) string {
 	ct := http.DetectContentType(data) // considers at most the first 512 bytes
 	if imageMediaTypes[ct] {
@@ -442,11 +427,11 @@ func SniffImage(data []byte) string {
 
 // DefaultImageURL is the built-in image transport: read the file, sniff
 // the media type, enforce maxImageBytes, and return a base64 data: URL
-// for an image_url content part. It is never installed implicitly — wire
-// it via Agent.ImageURL (cmd/nemo does) or replace it with a custom
-// transport, e.g. one that uploads the file and returns a hosted link
-// (prefer long-lived links: tool messages persist in the session history
-// and are re-sent every turn).
+// for an image_url content part. Nothing is wired implicitly — pass it
+// to NewReadTool (or DefaultTools) to enable image attachments, or
+// supply a custom transport instead, e.g. one that uploads the file and
+// returns a hosted link (prefer long-lived links: tool messages persist
+// in the session history and are re-sent every turn).
 func DefaultImageURL(ctx context.Context, path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -602,10 +587,14 @@ func containsCwd(dir string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// DefaultTools is the tool set the root agent runs with; Agent.Run itself
-// is tool-agnostic and takes its tools via the Agent.
-var DefaultTools = []Tool{
-	{
+// Default tool constructors. Each returns one ready-to-use Tool; the
+// agent itself is tool-agnostic, so embedders compose all of them
+// (DefaultTools), a subset (the individual constructors), or none (their
+// own tools) into the Agent.Tools slice.
+
+// NewFetchTool returns the outbound-HTTP fetch tool.
+func NewFetchTool() Tool {
+	return Tool{
 		Name:        "fetch",
 		Description: "make an HTTP request to a URL and return the response body or extracted readable content",
 		Parameters: map[string]any{
@@ -715,9 +704,13 @@ var DefaultTools = []Tool{
 
 			return out, nil
 		},
-	},
+	}
+}
 
-	{
+// NewReadTool returns the file-reading tool; imageURL attaches images the
+// model can see, nil = text-only summaries (attachments disabled).
+func NewReadTool(imageURL ImageTransport) Tool {
+	return Tool{
 		Name: "read",
 		Description: "read a text file; lines are prefixed with 1-indexed line numbers like \"123| text\" " +
 			"(strip that prefix when quoting file text elsewhere, e.g. in edit's old_text); " +
@@ -746,20 +739,20 @@ var DefaultTools = []Tool{
 			// ever sees of them. Sniffing happens before the binary check below
 			// because image formats trip it (PNG, GIF, BMP, WebP carry NUL
 			// bytes; a NUL-free JPEG would still sniff here first). The URL
-			// comes from the run's injected transport (Agent.ImageURL): the
-			// built-in base64 data URL or e.g. an upload returning a link.
+			// comes from the transport captured when the tool was built: the
+			// built-in base64 data URL, an upload returning a hosted link,
+			// or none at all (nil = disabled).
 			if media := SniffImage(data); media != "" {
 				if int64(len(data)) > maxImageBytes {
 					return "", fmt.Errorf("%s: %s image is %d bytes; image attachments are capped at %d bytes",
 						path, media, len(data), maxImageBytes)
 				}
 				summary := fmt.Sprintf("%s: %s image, %d bytes", path, media, len(data))
-				resolve := imageURLFrom(ctx)
 				attach := attachFrom(ctx)
-				if resolve == nil || attach == nil {
+				if imageURL == nil || attach == nil {
 					return summary + " (image attachments not supported here)", nil
 				}
-				url, err := resolve(ctx, path)
+				url, err := imageURL(ctx, path)
 				if err != nil {
 					return "", fmt.Errorf("image transport failed for %s: %w", path, err)
 				}
@@ -817,9 +810,12 @@ var DefaultTools = []Tool{
 			}
 			return b.String(), nil
 		},
-	},
+	}
+}
 
-	{
+// NewWriteTool returns the file-writing tool.
+func NewWriteTool() Tool {
+	return Tool{
 		Name:        "write",
 		Description: "write content to a file, creating or overwriting it (makes parent directories)",
 		Parameters: map[string]any{
@@ -831,7 +827,7 @@ var DefaultTools = []Tool{
 			"required": []string{"path", "content"},
 		},
 		Mutating: true,
-		Handler:  func(ctx context.Context, args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
 				return "", fmt.Errorf("path is required")
@@ -858,9 +854,12 @@ var DefaultTools = []Tool{
 			}
 			return fmt.Sprintf("wrote %d bytes to %s", len(content), path), nil
 		},
-	},
+	}
+}
 
-	{
+// NewEditTool returns the exact-replace editing tool.
+func NewEditTool() Tool {
+	return Tool{
 		Name:        "edit",
 		Description: "replace text in a file; old_text must occur exactly once",
 		Parameters: map[string]any{
@@ -873,7 +872,7 @@ var DefaultTools = []Tool{
 			"required": []string{"path", "old_text", "new_text"},
 		},
 		Mutating: true,
-		Handler:  func(ctx context.Context, args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			path, _ := args["path"].(string)
 			oldText, _ := args["old_text"].(string)
 			newText, _ := args["new_text"].(string)
@@ -900,9 +899,12 @@ var DefaultTools = []Tool{
 			}
 			return "ok", nil
 		},
-	},
+	}
+}
 
-	{
+// NewDeleteTool returns the file/directory deletion tool.
+func NewDeleteTool() Tool {
+	return Tool{
 		Name:        "delete",
 		Description: "delete a file or directory (irreversible); directories require recursive=true",
 		Parameters: map[string]any{
@@ -914,7 +916,7 @@ var DefaultTools = []Tool{
 			"required": []string{"path"},
 		},
 		Mutating: true,
-		Handler:  func(ctx context.Context, args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
 				return "", fmt.Errorf("path is required")
@@ -949,9 +951,12 @@ var DefaultTools = []Tool{
 			}
 			return fmt.Sprintf("deleted %s", path), nil
 		},
-	},
+	}
+}
 
-	{
+// NewGrepTool returns the regex content-search tool.
+func NewGrepTool() Tool {
+	return Tool{
 		Name:        "grep",
 		Description: "search file contents for a regex; returns matching lines as path:line: text; binary files and gitignored paths are skipped",
 		Parameters: map[string]any{
@@ -1018,9 +1023,12 @@ var DefaultTools = []Tool{
 			}
 			return strings.Join(out, "\n"), nil
 		},
-	},
+	}
+}
 
-	{
+// NewFindTool returns the glob file-finding tool.
+func NewFindTool() Tool {
+	return Tool{
 		Name:        "find",
 		Description: "find files whose name or path matches a glob pattern (e.g. *.go, **/*_test.go); gitignored paths are skipped",
 		Parameters: map[string]any{
@@ -1072,9 +1080,12 @@ var DefaultTools = []Tool{
 			}
 			return strings.Join(out, "\n"), nil
 		},
-	},
+	}
+}
 
-	{
+// NewLsTool returns the directory-listing tool.
+func NewLsTool() Tool {
+	return Tool{
 		Name:        "ls",
 		Description: "list directory entries (directories get a trailing /)",
 		Parameters: map[string]any{
@@ -1106,7 +1117,24 @@ var DefaultTools = []Tool{
 			}
 			return strings.Join(out, "\n"), nil
 		},
-	},
+	}
+}
+
+// DefaultTools returns nemo's standard tool set, wiring the image
+// transport into read; imageURL may be nil (attachments disabled).
+// Embedders wanting a subset (or none) of these tools compose the
+// New*Tool constructors, or their own, into Agent.Tools directly.
+func DefaultTools(imageURL ImageTransport) []Tool {
+	return []Tool{
+		NewFetchTool(),
+		NewReadTool(imageURL),
+		NewWriteTool(),
+		NewEditTool(),
+		NewDeleteTool(),
+		NewGrepTool(),
+		NewFindTool(),
+		NewLsTool(),
+	}
 }
 
 // buildToolSpecs renders tools as OpenAI-style function specs, preserving
@@ -1867,11 +1895,6 @@ type Agent struct {
 	MaxTokens         int            // 0 = omit from the request
 	MaxToolIterations int            // 0 = default
 	SystemPrompt      string
-	// ImageURL turns an image file into a URL the model can see in an
-	// image_url content part: the built-in DefaultImageURL (base64 data
-	// URL) or e.g. an upload that returns a hosted link. nil = read
-	// reports images as text-only summaries (attachments disabled).
-	ImageURL func(ctx context.Context, path string) (string, error)
 }
 
 // buildRequestBody assembles the chat-completions request payload from the
@@ -1915,12 +1938,6 @@ func (ag *Agent) Run(
 
 	addMessage := func(msg map[string]any) {
 		s.Messages = append(s.Messages, msg)
-	}
-
-	// The image transport (when configured) rides in the context so tool
-	// handlers can resolve image paths to URLs the model can see.
-	if ag.ImageURL != nil {
-		ctx = WithImageURL(ctx, ag.ImageURL)
 	}
 
 	if len(s.Messages) == 0 && ag.SystemPrompt != "" {

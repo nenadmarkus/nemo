@@ -186,13 +186,11 @@ func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
 		Endpoint:     endpoint,
 		APIKey:       apiKey,
 		Model:        cfg.Model,
-		Tools:        nemo.DefaultTools,
+		Tools:        nemo.DefaultTools(webpImageURL),
 		Provider:     cfg.Provider,
 		Temperature:  cfg.Temperature,
 		MaxTokens:    cfg.MaxTokens,
 		SystemPrompt: nemo.ProjectPrompt(nemo.GroundedPrompt(nemo.SystemPrompt), "."),
-		// Smart transport instead of nemo.DefaultImageURL: resize + WebP.
-		ImageURL: webpImageURL,
 	}
 }
 
@@ -205,9 +203,9 @@ func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
 // while staying readable.
 const maxImageDimension = 2000
 
-// webpImageURL is the CLI's image transport (Agent.ImageURL): decode any
-// image SniffImage admits (blank imports above register the decoders,
-// webp and bmp included), downscale to maxImageDimension on the longest
+// webpImageURL is the CLI's image transport (wired into the read tool
+// via nemo.DefaultTools): decode any image SniffImage admits (blank
+// imports above register the decoders, webp and bmp included), downscale to maxImageDimension on the longest
 // side, and re-encode as lossy WebP (quality 80, method 4) via
 // deepteams/webp — a 4 MiB phone photo becomes a few hundred KB data:
 // URL. Caveats: animated GIFs contribute their first frame only, animated

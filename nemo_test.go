@@ -670,7 +670,7 @@ func TestProcessToolCallsImageAttachment(t *testing.T) {
 
 func toolByName(t *testing.T, name string) Tool {
 	t.Helper()
-	for _, tt := range DefaultTools {
+	for _, tt := range DefaultTools(nil) {
 		if tt.Name == name {
 			return tt
 		}
@@ -841,20 +841,21 @@ func TestDefaultImageURL(t *testing.T) {
 }
 
 func TestReadImageTool(t *testing.T) {
-	tool := toolByName(t, "read")
 	img := pngBytes(t)
 	p := filepath.Join(t.TempDir(), "shot.png")
 	mustWrite(t, p, string(img))
 
-	// Fully wired context: transport resolver + attachment collector. The
-	// resolver's URL is attached verbatim; the result text stays a
-	// one-line summary (no URL or base64 in it).
+	// A read tool with a wired transport: the URL it returns is attached
+	// verbatim; the result text stays a one-line summary (no URL or
+	// base64 in it).
 	var got []string
-	ctx := WithImageURL(WithAttachments(context.Background(), func(u string) {
+	ctx := WithAttachments(context.Background(), func(u string) {
 		got = append(got, u)
-	}), func(ctx context.Context, path string) (string, error) {
-		return "https://example.com/" + filepath.Base(path), nil
 	})
+	upload := func(ctx context.Context, path string) (string, error) {
+		return "https://example.com/" + filepath.Base(path), nil
+	}
+	tool := NewReadTool(upload)
 	out, err := tool.Handler(ctx, map[string]any{"path": p})
 	if err != nil {
 		t.Fatal(err)
@@ -867,24 +868,35 @@ func TestReadImageTool(t *testing.T) {
 		t.Errorf("attachments = %v, want %v", got, want)
 	}
 
-	// No transport installed (handler invoked outside a run): the summary
-	// degrades gracefully instead of failing.
-	out, err = tool.Handler(context.Background(), map[string]any{"path": p})
+	// nil transport (attachments disabled): the summary degrades
+	// gracefully instead of failing.
+	out, err = NewReadTool(nil).Handler(ctx, map[string]any{"path": p})
 	if err != nil {
 		t.Fatal(err)
 	}
 	want = fmt.Sprintf("%s: image/png image, %d bytes (image attachments not supported here)", p, len(img))
 	if out != want {
-		t.Errorf("read (image, no transport) = %q, want %q", out, want)
+		t.Errorf("read (image, nil transport) = %q, want %q", out, want)
+	}
+
+	// A transport but no attachment collector (handler invoked outside a
+	// run): the same graceful degradation.
+	out, err = tool.Handler(context.Background(), map[string]any{"path": p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != want {
+		t.Errorf("read (image, no collector) = %q, want %q", out, want)
 	}
 
 	// A failing transport surfaces its error to the model and attaches nothing.
-	failCtx := WithImageURL(WithAttachments(context.Background(), func(u string) {
-		t.Error("collector called despite transport failure")
-	}), func(ctx context.Context, path string) (string, error) {
+	failTool := NewReadTool(func(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("s3 put failed")
 	})
-	if _, err := tool.Handler(failCtx, map[string]any{"path": p}); err == nil || !strings.Contains(err.Error(), "image transport failed") {
+	failCtx := WithAttachments(context.Background(), func(u string) {
+		t.Error("collector called despite transport failure")
+	})
+	if _, err := failTool.Handler(failCtx, map[string]any{"path": p}); err == nil || !strings.Contains(err.Error(), "image transport failed") {
 		t.Errorf("transport failure err = %v, want image transport failed", err)
 	}
 
@@ -892,7 +904,7 @@ func TestReadImageTool(t *testing.T) {
 	fake := filepath.Join(filepath.Dir(p), "fake.png")
 	mustWrite(t, fake, "one\ntwo")
 	textCtx := WithAttachments(context.Background(), func(u string) {})
-	out, err = tool.Handler(textCtx, map[string]any{"path": fake})
+	out, err = NewReadTool(nil).Handler(textCtx, map[string]any{"path": fake})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1355,9 +1367,8 @@ func TestSpikeToolImageTransport(t *testing.T) {
 		Endpoint:     "https://openrouter.ai/api/v1/chat/completions",
 		APIKey:       apiKey,
 		Model:        model,
-		Tools:        DefaultTools,
+		Tools:        DefaultTools(DefaultImageURL),
 		SystemPrompt: SystemPrompt,
-		ImageURL:     DefaultImageURL,
 	}
 	var reply strings.Builder
 	err = ag.Run(context.Background(), s,
