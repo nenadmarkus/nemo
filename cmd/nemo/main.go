@@ -27,8 +27,8 @@ import (
 	"syscall"
 
 	"github.com/deepteams/webp"
-	"golang.org/x/image/draw"
 	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 
 	"nemo"
@@ -190,7 +190,7 @@ func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
 		Provider:     cfg.Provider,
 		Temperature:  cfg.Temperature,
 		MaxTokens:    cfg.MaxTokens,
-		SystemPrompt: nemo.ProjectPrompt(nemo.GroundedPrompt(nemo.SystemPrompt), "."),
+		SystemPrompt: nemo.GroundedPrompt(nemo.SystemPrompt),
 	}
 }
 

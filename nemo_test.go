@@ -110,11 +110,11 @@ func TestTruncateUTF8(t *testing.T) {
 		limit     int
 		want      string
 	}{
-		{"hello", "!", 10, "hello"},  // under limit: untouched
-		{"hello", "!", 5, "hello"},   // exactly at limit: untouched
-		{"hello", "…", 3, "hel…"},    // ASCII cut
-		{"héllo", "!", 2, "h!"},      // cut inside é: back up to rune start
-		{"日本語", "!", 6, "日本!"},    // cut lands exactly between runes
+		{"hello", "!", 10, "hello"}, // under limit: untouched
+		{"hello", "!", 5, "hello"},  // exactly at limit: untouched
+		{"hello", "…", 3, "hel…"},   // ASCII cut
+		{"héllo", "!", 2, "h!"},     // cut inside é: back up to rune start
+		{"日本語", "!", 6, "日本!"},      // cut lands exactly between runes
 	}
 	for _, tt := range tests {
 		if got := TruncateUTF8(tt.s, tt.limit, tt.marker); got != tt.want {
@@ -143,14 +143,14 @@ func TestParseGitignore(t *testing.T) {
 		want  bool
 	}{
 		{"x.log", false, true},
-		{"dir/x.log", false, true},  // unanchored globs match at any depth
-		{"keep.log", false, false},  // ! negation, last match wins
-		{"build", true, true},       // trailing slash: dirs only
-		{"build", false, false},     // ... so a file named build survives
-		{"a/build", true, true},     // unanchored dir pattern matches nested
-		{"docs", true, true},        // anchored
+		{"dir/x.log", false, true},      // unanchored globs match at any depth
+		{"keep.log", false, false},      // ! negation, last match wins
+		{"build", true, true},           // trailing slash: dirs only
+		{"build", false, false},         // ... so a file named build survives
+		{"a/build", true, true},         // unanchored dir pattern matches nested
+		{"docs", true, true},            // anchored
 		{"docs/file.txt", false, false}, // anchored patterns cover only the exact path (simplified parser)
-		{"data1", false, true},      // ? matches one char
+		{"data1", false, true},          // ? matches one char
 		{"data12", false, false},
 	}
 	for _, tt := range tests {
@@ -290,11 +290,11 @@ func TestDiffLines(t *testing.T) {
 
 func TestUsage(t *testing.T) {
 	u := parseUsage(map[string]any{
-		"prompt_tokens":               float64(10),
-		"completion_tokens":           float64(5),
-		"prompt_tokens_details":       map[string]any{"cached_tokens": float64(3)},
-		"completion_tokens_details":   map[string]any{"reasoning_tokens": float64(2)},
-		"cost":                        float64(0.5),
+		"prompt_tokens":             float64(10),
+		"completion_tokens":         float64(5),
+		"prompt_tokens_details":     map[string]any{"cached_tokens": float64(3)},
+		"completion_tokens_details": map[string]any{"reasoning_tokens": float64(2)},
+		"cost":                      float64(0.5),
 	})
 	if got, want := u.String(), "10 in / 5 out (3 cached) (2 reasoning) $0.50000"; got != want {
 		t.Errorf("usage.String() = %q, want %q", got, want)
@@ -342,9 +342,9 @@ func TestNumAs(t *testing.T) {
 
 func TestExtractUpstreamError(t *testing.T) {
 	tests := []struct {
-		name  string
-		body  map[string]any
-		want  string
+		name string
+		body map[string]any
+		want string
 	}{
 		{"string error", map[string]any{"error": "boom"}, "boom"},
 		{"object error", map[string]any{"error": map[string]any{"message": "quota exceeded"}}, "quota exceeded"},
@@ -485,7 +485,10 @@ func TestProcessToolCallsParallel(t *testing.T) {
 		batchCall("b", "r", `{"x":"b"}`),
 	}
 
-	type report struct{ id, name, args, detail string; ok bool }
+	type report struct {
+		id, name, args, detail string
+		ok                     bool
+	}
 	var got []report
 	var messages []map[string]any
 	done := make(chan struct{})
@@ -1115,146 +1118,6 @@ func TestGrepTool(t *testing.T) {
 	}
 	if out != "no matches" {
 		t.Errorf("grep (no match) = %q, want no matches", out)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// AGENTS.md context files: contextFileIn, findContextFiles,
-// loadAgentsInstructions, ProjectPrompt.
-// ---------------------------------------------------------------------------
-
-// TestContextFileIn pins the per-directory precedence: exactly one file is
-// taken per directory, AGENTS.override.md > AGENTS.md > CLAUDE.md.
-func TestContextFileIn(t *testing.T) {
-	tmp := t.TempDir()
-
-	if got := contextFileIn(tmp); got != "" {
-		t.Errorf("contextFileIn(empty dir) = %q, want \"\"", got)
-	}
-
-	// AGENTS.md beats CLAUDE.md in the same directory.
-	mustWrite(t, filepath.Join(tmp, "AGENTS.md"), "a")
-	mustWrite(t, filepath.Join(tmp, "CLAUDE.md"), "c")
-	if got := contextFileIn(tmp); got != filepath.Join(tmp, "AGENTS.md") {
-		t.Errorf("contextFileIn(AGENTS+CLAUDE) = %q, want AGENTS.md", got)
-	}
-
-	// The override replaces both.
-	mustWrite(t, filepath.Join(tmp, "AGENTS.override.md"), "o")
-	if got := contextFileIn(tmp); got != filepath.Join(tmp, "AGENTS.override.md") {
-		t.Errorf("contextFileIn(with override) = %q, want AGENTS.override.md", got)
-	}
-
-	// A directory named like a context file is not a context file.
-	d := t.TempDir()
-	mustMkdir(t, filepath.Join(d, "AGENTS.md"))
-	if got := contextFileIn(d); got != "" {
-		t.Errorf("contextFileIn(dir named AGENTS.md) = %q, want \"\"", got)
-	}
-
-	// CLAUDE.md alone still counts (legacy compatibility).
-	c := t.TempDir()
-	mustWrite(t, filepath.Join(c, "CLAUDE.md"), "c")
-	if got := contextFileIn(c); got != filepath.Join(c, "CLAUDE.md") {
-		t.Errorf("contextFileIn(CLAUDE only) = %q, want CLAUDE.md", got)
-	}
-}
-
-// TestFindContextFiles pins the ancestor walk: files from dir and every
-// ancestor, outermost first so closer (more specific) files come last.
-func TestFindContextFiles(t *testing.T) {
-	tmp := t.TempDir()
-	mustWrite(t, filepath.Join(tmp, "AGENTS.md"), "root rules")
-	mustMkdir(t, filepath.Join(tmp, "a"))
-	mustWrite(t, filepath.Join(tmp, "a", "CLAUDE.md"), "mid rules")
-	mustMkdir(t, filepath.Join(tmp, "a", "b"))
-	mustWrite(t, filepath.Join(tmp, "a", "b", "AGENTS.override.md"), "override")
-	mustWrite(t, filepath.Join(tmp, "a", "b", "AGENTS.md"), "shadowed") // override wins
-	mustMkdir(t, filepath.Join(tmp, "a", "b", "c"))                     // contributes nothing
-
-	got := findContextFiles(filepath.Join(tmp, "a", "b", "c"))
-	want := []string{
-		filepath.Join(tmp, "AGENTS.md"),
-		filepath.Join(tmp, "a", "CLAUDE.md"),
-		filepath.Join(tmp, "a", "b", "AGENTS.override.md"),
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("findContextFiles = %v, want %v (outermost first)", got, want)
-	}
-
-	// A tree without context files yields none.
-	empty := t.TempDir()
-	deep := filepath.Join(empty, "x", "y", "z")
-	mustMkdir(t, deep)
-	if got := findContextFiles(deep); len(got) != 0 {
-		t.Errorf("findContextFiles(no files) = %v, want none", got)
-	}
-}
-
-func TestLoadAgentsInstructions(t *testing.T) {
-	tmp := t.TempDir()
-	mustWrite(t, filepath.Join(tmp, "AGENTS.md"), "outer\n")
-	mustMkdir(t, filepath.Join(tmp, "ws"))
-	mustWrite(t, filepath.Join(tmp, "ws", "AGENTS.md"), " \n\n") // blank: skipped
-	mustMkdir(t, filepath.Join(tmp, "ws", "deep"))
-	mustWrite(t, filepath.Join(tmp, "ws", "deep", "AGENTS.md"), "inner")
-
-	// Blocks labeled with their path, outermost first, closest last.
-	got := loadAgentsInstructions(filepath.Join(tmp, "ws", "deep"))
-	want := fmt.Sprintf("# From %s:\nouter\n\n# From %s:\ninner",
-		filepath.Join(tmp, "AGENTS.md"), filepath.Join(tmp, "ws", "deep", "AGENTS.md"))
-	if got != want {
-		t.Errorf("loadAgentsInstructions = %q, want %q", got, want)
-	}
-
-	// Nothing found: empty string.
-	empty := t.TempDir()
-	mustMkdir(t, filepath.Join(empty, "sub"))
-	if got := loadAgentsInstructions(filepath.Join(empty, "sub")); got != "" {
-		t.Errorf("loadAgentsInstructions(no files) = %q, want \"\"", got)
-	}
-
-	// Oversized instructions are truncated UTF-8-safely with a marker.
-	// The content is pure ASCII, so the cut lands exactly at the cap.
-	big := t.TempDir()
-	mustWrite(t, filepath.Join(big, "AGENTS.md"), strings.Repeat("x", maxAgentsBytes+1000))
-	got = loadAgentsInstructions(big)
-	const marker = "\n...[instructions truncated]"
-	if !strings.HasSuffix(got, marker) {
-		t.Errorf("truncated instructions missing marker, tail = %q", got[max(0, len(got)-40):])
-	}
-	if len(got) != maxAgentsBytes+len(marker) {
-		t.Errorf("truncated length = %d, want %d", len(got), maxAgentsBytes+len(marker))
-	}
-}
-
-// TestProjectPrompt pins the system-prompt wiring: instructions are
-// appended with a header, and the base prompt passes through untouched
-// when the workspace has no context files.
-func TestProjectPrompt(t *testing.T) {
-	base := "base prompt"
-
-	empty := t.TempDir()
-	mustMkdir(t, filepath.Join(empty, "sub"))
-	if got := ProjectPrompt(base, filepath.Join(empty, "sub")); got != base {
-		t.Errorf("ProjectPrompt without context files = %q, want %q", got, base)
-	}
-
-	tmp := t.TempDir()
-	mustWrite(t, filepath.Join(tmp, "AGENTS.md"), "always run `make test`")
-	got := ProjectPrompt(base, tmp)
-	for _, want := range []string{
-		"base prompt\n\nProject instructions",
-		"when instructions conflict, closer files win",
-		"# From " + filepath.Join(tmp, "AGENTS.md") + ":",
-		"always run `make test`",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("ProjectPrompt missing %q in:\n%s", want, got)
-		}
-	}
-	if !strings.HasSuffix(got, "always run `make test`") {
-		t.Errorf("ProjectPrompt should end with the instructions, got tail %q", got[len(got)-80:])
 	}
 }
 
