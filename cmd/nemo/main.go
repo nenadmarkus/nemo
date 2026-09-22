@@ -19,10 +19,8 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
-	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -38,45 +36,13 @@ import (
 // Configuration.
 // ---------------------------------------------------------------------------
 
-// config is the parsed contents of a nemo JSON config file. Every field
-// is optional; unset fields keep their defaults, and a base_url without
-// an explicit provider drops the OpenRouter-specific routing hints.
 type config struct {
 	BaseURL     string         `json:"base_url"` // e.g. "https://api.openai.com/v1"
 	Model       string         `json:"model"`
 	APIKey      string         `json:"api_key"`
-	Provider    map[string]any `json:"provider"`    // OpenRouter routing hints
+	Provider    map[string]any `json:"provider"`    // routing hints
 	Temperature *float64       `json:"temperature"` // nil = provider default
 	MaxTokens   int            `json:"max_tokens"`  // 0 = provider default
-}
-
-// Zero-config defaults: OpenRouter with the DeepSeek flash model.
-const (
-	defaultBaseURL = "https://openrouter.ai/api/v1/chat/completions"
-	defaultModel   = "deepseek/deepseek-v4.1-flash"
-)
-
-var defaultProvider = map[string]any{"order": []string{"DeepSeek"}, "allow_fallbacks": true}
-
-// defaults returns the zero-config configuration.
-func defaults() config {
-	return config{BaseURL: defaultBaseURL, Model: defaultModel, Provider: defaultProvider}
-}
-
-// configSearchPaths lists the implicit config locations in precedence
-// order: the workspace's .nemo/config.json, then the user-level one.
-func configSearchPaths() []string {
-	paths := []string{filepath.Join(".nemo", "config.json")}
-	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".nemo", "config.json"))
-	}
-	return paths
-}
-
-// fileExists reports whether path is a regular file.
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }
 
 // loadConfig reads and parses a JSON config file; errors name the file so
@@ -93,98 +59,13 @@ func loadConfig(path string) (config, error) {
 	return cfg, nil
 }
 
-// mergeConfig overlays the fields cfg sets onto base and returns the
-// result. Provider routing hints are endpoint-specific: pointing base_url
-// elsewhere without naming providers drops the default OpenRouter hints.
-func mergeConfig(base, cfg config) config {
-	if cfg.BaseURL != "" {
-		base.BaseURL = cfg.BaseURL
-		if cfg.Provider == nil {
-			base.Provider = nil
-		}
-	}
-	if cfg.Model != "" {
-		base.Model = cfg.Model
-	}
-	if cfg.APIKey != "" {
-		base.APIKey = cfg.APIKey
-	}
-	if cfg.Provider != nil {
-		base.Provider = cfg.Provider
-	}
-	if cfg.Temperature != nil {
-		base.Temperature = cfg.Temperature
-	}
-	if cfg.MaxTokens > 0 {
-		base.MaxTokens = cfg.MaxTokens
-	}
-	return base
-}
-
-// resolveConfig finds and loads the configuration. An explicit -config
-// path is used as given (a missing or malformed file is an error);
-// otherwise the first existing search path wins. The returned source
-// labels where the configuration came from ("defaults" or a path).
-func resolveConfig(flagPath string) (cfg config, source string, err error) {
-	paths := []string{flagPath}
-	if flagPath == "" {
-		paths = configSearchPaths()
-	}
-	for _, p := range paths {
-		if flagPath == "" && !fileExists(p) {
-			continue
-		}
-		loaded, err := loadConfig(p)
-		if err != nil {
-			return config{}, "", err
-		}
-		return mergeConfig(defaults(), loaded), p, nil
-	}
-	return defaults(), "defaults", nil
-}
-
-// normalizeChatURL turns an OpenAI-compatible base URL (e.g.
-// "https://api.openai.com/v1") into a chat-completions endpoint by
-// appending /chat/completions when missing; an already-complete endpoint
-// passes through (trailing slashes tolerated), and non-http(s) URLs are
-// rejected.
-func normalizeChatURL(base string) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("base_url %q: %w", base, err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("base_url %q: only http/https are supported", base)
-	}
-	p := strings.TrimSuffix(u.Path, "/")
-	if !strings.HasSuffix(p, "/chat/completions") {
-		p += "/chat/completions"
-	}
-	u.Path = p
-	return u.String(), nil
-}
-
-// isLocalhostURL reports whether the endpoint points at the local host,
-// where API keys are usually unnecessary (Ollama, LM Studio).
-func isLocalhostURL(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	switch u.Hostname() {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	}
-	return false
-}
-
 // buildAgent assembles the root agent from a resolved config; all model
 // and endpoint data enters the library through Agent fields.
-func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
+func buildAgent(cfg config) *nemo.Agent {
 	return &nemo.Agent{
 		Name:         "root",
-		Endpoint:     endpoint,
-		APIKey:       apiKey,
+		Endpoint:     cfg.BaseURL,
+		APIKey:       cfg.APIKey,
 		Model:        cfg.Model,
 		Tools:        nemo.DefaultTools(webpImageURL),
 		Provider:     cfg.Provider,
@@ -198,20 +79,6 @@ func buildAgent(cfg config, apiKey, endpoint string) *nemo.Agent {
 // Image transport: resize + WebP re-encode.
 // ---------------------------------------------------------------------------
 
-// maxImageDimension caps the longest side of an attached image; vision
-// models charge by area/tile, so a ≤2000px WebP keeps attachments cheap
-// while staying readable.
-const maxImageDimension = 2000
-
-// webpImageURL is the CLI's image transport (wired into the read tool
-// via nemo.DefaultTools): decode any image SniffImage admits (blank
-// imports above register the decoders, webp and bmp included), downscale to maxImageDimension on the longest
-// side, and re-encode as lossy WebP (quality 80, method 4) via
-// deepteams/webp — a 4 MiB phone photo becomes a few hundred KB data:
-// URL. Caveats: animated GIFs contribute their first frame only, animated
-// WebP input fails at decode, and EXIF rotation is not applied. ctx is
-// part of the transport signature but unused: decode/encode are
-// CPU-bound and quick at these sizes.
 func webpImageURL(ctx context.Context, path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -228,6 +95,7 @@ func webpImageURL(ctx context.Context, path string) (string, error) {
 
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
+	const maxImageDimension = 2048
 	if w > maxImageDimension || h > maxImageDimension {
 		scale := float64(maxImageDimension) / float64(max(w, h))
 		dst := image.NewRGBA(image.Rect(0, 0,
@@ -249,33 +117,16 @@ func webpImageURL(ctx context.Context, path string) (string, error) {
 }
 
 func main() {
-	configPath := flag.String("config", "", "path to a JSON config file (default: ./.nemo/config.json, then ~/.nemo/config.json)")
+	configPath := flag.String("config", "", "path to a JSON config file")
 	flag.Parse()
 
-	cfg, source, err := resolveConfig(*configPath)
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 
-	endpoint, err := normalizeChatURL(cfg.BaseURL)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-
-	// Key resolution: a config api_key wins over the OPENROUTER_API_KEY
-	// environment variable; local endpoints run keyless.
-	apiKey := cfg.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENROUTER_API_KEY")
-	}
-	if apiKey == "" && !isLocalhostURL(endpoint) {
-		fmt.Fprintf(os.Stderr, "error: no API key: set \"api_key\" in %s or export OPENROUTER_API_KEY\n", source)
-		os.Exit(1)
-	}
-
-	root := buildAgent(cfg, apiKey, endpoint)
+	root := buildAgent(cfg)
 
 	// Stream callbacks: render reasoning/output/tool/system blocks, each
 	// starting on a fresh line with its own header so phases are unmistakable.
@@ -379,7 +230,7 @@ func main() {
 	s := nemo.NewSession()
 
 	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
-	fmt.Printf("nemo: config=%s model=%s base=%s\n", source, root.Model, root.Endpoint)
+	fmt.Printf("nemo: model=%s base=%s\n", root.Model, root.Endpoint)
 
 	// Signals: Ctrl-C/SIGTERM during a run cancels just that turn; at the
 	// prompt it discards the pending line (the tty does that anyway) and a
