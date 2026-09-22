@@ -4,7 +4,10 @@
 // current directory. Model and endpoint come from a flat JSON config
 // file (-config path, ./.nemo/config.json, or ~/.nemo/config.json),
 // falling back to OpenRouter defaults with $OPENROUTER_API_KEY. Ctrl+C
-// aborts the running turn; "exit" or Ctrl-D quits.
+// aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
+// nemo runs one shot instead: the string is a path to an instruction file
+// if it exists on disk, otherwise the instruction text itself; a single
+// turn runs and the process exits.
 package main
 
 import (
@@ -118,6 +121,8 @@ func webpImageURL(ctx context.Context, path string) (string, error) {
 
 func main() {
 	configPath := flag.String("config", "", "path to a JSON config file")
+	task := flag.String("task", "", "one-shot mode: run a single instruction and exit; " +
+		"<string> is a path to an instruction file if it exists on disk, otherwise the instruction text itself")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -229,15 +234,82 @@ func main() {
 
 	s := nemo.NewSession()
 
-	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
-	fmt.Printf("nemo: model=%s base=%s\n", root.Model, root.Endpoint)
-
 	// Signals: Ctrl-C/SIGTERM during a run cancels just that turn; at the
 	// prompt it discards the pending line (the tty does that anyway) and a
 	// second consecutive press exits. Default signal disposition is never
-	// relied on, so a stray SIGINT cannot kill the session.
+	// relied on, so a stray SIGINT cannot kill the session. One-shot mode
+	// reuses the channel to cancel its single turn.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	// reportUsage prints the token/cost delta for a turn that started when
+	// session usage stood at uBefore, plus session totals; silent when the
+	// provider reports no usage.
+	reportUsage := func(uBefore nemo.Usage) {
+		if turn := s.Usage.Delta(uBefore); turn.PromptTokens > 0 || turn.CompletionTokens > 0 {
+			fmt.Fprintf(os.Stderr, "[usage] turn: %s | session: %s\n", turn, s.Usage)
+		}
+	}
+
+	// One-shot mode: -task <string> names a file on disk (instruction read
+	// from it) or is the instruction text itself. A single turn runs, then
+	// nemo exits: 0 on success, non-zero on error or interrupt.
+	if *task != "" {
+		instruction := *task
+		if _, err := os.Stat(*task); err == nil {
+			data, err := os.ReadFile(*task)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			instruction = strings.TrimSpace(string(data))
+		}
+		if instruction == "" {
+			fmt.Fprintln(os.Stderr, "error: --task: instruction is empty")
+			os.Exit(1)
+		}
+
+		baseCtx := nemo.WithDisplay(context.Background(), onDiff)
+		turnCtx, cancel := context.WithTimeout(baseCtx, nemo.RunTimeout)
+		before := len(s.Messages)
+		uBefore := s.Usage
+
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- root.Run(turnCtx, s, instruction,
+				onReasoning, onContent, onSystem, onTool)
+		}()
+
+		var err error
+		interrupted := false
+		select {
+		case err = <-runDone:
+		case <-sigCh:
+			cancel()
+			interrupted = true
+			err = <-runDone // wait for the run to unwind
+		}
+		cancel()
+
+		if err != nil || interrupted {
+			// Drop a partial exchange (e.g. tool_calls without their
+			// results); the process exits anyway, but nothing half-
+			// finished is left in the session.
+			s.Messages = s.Messages[:before]
+			if interrupted {
+				fmt.Fprintln(os.Stderr, "\n[interrupted; turn dropped]")
+			} else {
+				fmt.Fprintln(os.Stderr, "error:", err)
+			}
+			os.Exit(1)
+		}
+		reportUsage(uBefore)
+		fmt.Println()
+		os.Exit(0)
+	}
+
+	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
+	fmt.Printf("nemo: model=%s base=%s\n", root.Model, root.Endpoint)
 
 	// stdin is read from a goroutine so the prompt can select on input
 	// and signals at once.
@@ -288,14 +360,6 @@ func main() {
 		before := len(s.Messages)
 		uBefore := s.Usage
 
-		// reportUsage prints the turn's token/cost delta plus session
-		// totals; silent when the provider reports no usage.
-		reportUsage := func() {
-			if turn := s.Usage.Delta(uBefore); turn.PromptTokens > 0 || turn.CompletionTokens > 0 {
-				fmt.Fprintf(os.Stderr, "[usage] turn: %s | session: %s\n", turn, s.Usage)
-			}
-		}
-
 		runDone := make(chan error, 1)
 		go func() {
 			runDone <- root.Run(turnCtx, s, input,
@@ -329,14 +393,14 @@ func main() {
 			} else {
 				fmt.Fprintln(os.Stderr, "error:", err)
 			}
-			reportUsage()
+			reportUsage(uBefore)
 			continue
 		}
 		if interrupted {
 			// Race: the turn completed before the cancel took effect.
 			fmt.Fprintln(os.Stderr, "\n[turn completed before interrupt; kept]")
 		}
-		reportUsage()
+		reportUsage(uBefore)
 
 		fmt.Println()
 	}
