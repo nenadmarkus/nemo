@@ -2,9 +2,9 @@
 // nemo agent library: it reads prompts, streams the model's reasoning,
 // output, and tool activity, and applies the workspace tools in the
 // current directory. Model and endpoint come from a flat JSON config
-// file (-config path, ./.nemo/config.json, or ~/.nemo/config.json),
-// falling back to OpenRouter defaults with $OPENROUTER_API_KEY. Ctrl+C
-// aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
+// passed with -config: either a path to a JSON file or the JSON text
+// itself; the flag is required, and there are no implicit defaults.
+// Ctrl+C aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
 // nemo runs one shot instead: the string is a path to an instruction file
 // if it exists on disk, otherwise the instruction text itself; a single
 // turn runs and the process exits.
@@ -48,16 +48,24 @@ type config struct {
 	MaxTokens   int            `json:"max_tokens"`  // 0 = provider default
 }
 
-// loadConfig reads and parses a JSON config file; errors name the file so
-// a bad config is loud and actionable.
-func loadConfig(path string) (config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return config{}, fmt.Errorf("config %s: %w", path, err)
+// loadConfig parses the -config value: a path to a JSON config file if one
+// exists on disk, otherwise the JSON text itself (mirroring -task). Inline
+// parse errors never echo the value, which may hold the API key.
+func loadConfig(value string) (config, error) {
+	data, fromFile := []byte(value), false
+	if !strings.HasPrefix(strings.TrimSpace(value), "{") {
+		b, err := os.ReadFile(value)
+		if err != nil {
+			return config{}, fmt.Errorf("config %s: %w", value, err)
+		}
+		data, fromFile = b, true
 	}
 	var cfg config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return config{}, fmt.Errorf("config %s: %w", path, err)
+		if fromFile {
+			return config{}, fmt.Errorf("config %s: %w", value, err)
+		}
+		return config{}, fmt.Errorf("config: invalid JSON: %w", err)
 	}
 	return cfg, nil
 }
@@ -120,8 +128,8 @@ func webpImageURL(ctx context.Context, path string) (string, error) {
 }
 
 func main() {
-	configPath := flag.String("config", "", "path to a JSON config file")
-	task := flag.String("task", "", "one-shot mode: run a single instruction and exit; " +
+	configPath := flag.String("config", "", "path to a JSON config file, or the JSON config text itself")
+	task := flag.String("task", "", "one-shot mode: run a single instruction and exit; "+
 		"<string> is a path to an instruction file if it exists on disk, otherwise the instruction text itself")
 	flag.Parse()
 

@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -101,5 +102,78 @@ func TestWebPImageURLRejectsNonImages(t *testing.T) {
 	p := writeTemp(t, "fake.png", []byte("one\ntwo"))
 	if _, err := webpImageURL(context.Background(), p); err == nil || !strings.Contains(err.Error(), "not a supported image") {
 		t.Errorf("fake.png err = %v, want not-a-supported-image error", err)
+	}
+}
+
+func TestLoadConfig(t *testing.T) {
+	temp := 0.5
+	filePath := writeTemp(t, "config.json", []byte(
+		`{"base_url":"http://file","model":"file-model","api_key":"file-key",`+
+			`"temperature":0.5,"max_tokens":128}`))
+
+	tests := []struct {
+		name    string
+		value   string
+		want    config
+		wantErr string // substring; "" = no error
+	}{
+		{
+			name:  "file path",
+			value: filePath,
+			want: config{
+				BaseURL: "http://file", Model: "file-model", APIKey: "file-key",
+				Temperature: &temp, MaxTokens: 128,
+			},
+		},
+		{
+			name:  "inline JSON",
+			value: `{"base_url":"http://inline","model":"inline-model","api_key":"inline-key"}`,
+			want:  config{BaseURL: "http://inline", Model: "inline-model", APIKey: "inline-key"},
+		},
+		{
+			name:  "inline JSON with surrounding whitespace",
+			value: "\n\t {\"model\":\"ws-model\"} \n",
+			want:  config{Model: "ws-model"},
+		},
+		{
+			name:  "inline empty object",
+			value: "{}",
+			want:  config{},
+		},
+		{
+			name:    "inline invalid JSON does not echo the value",
+			value:   `{"api_key":"super-secret-sentinel",`,
+			wantErr: "config: invalid JSON",
+		},
+		{
+			name:    "missing file path",
+			value:   filepath.Join(t.TempDir(), "nope.json"),
+			wantErr: "no such file",
+		},
+		{
+			name:    "empty value",
+			value:   "",
+			wantErr: "config : open",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := loadConfig(tt.value)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("loadConfig(%q) err = %v, want containing %q", tt.value, err, tt.wantErr)
+				}
+				if strings.Contains(err.Error(), "super-secret-sentinel") {
+					t.Fatalf("loadConfig(%q) error leaks the value: %v", tt.value, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig(%q): %v", tt.value, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("loadConfig(%q) = %+v, want %+v", tt.value, got, tt.want)
+			}
+		})
 	}
 }
