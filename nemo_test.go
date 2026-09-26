@@ -1122,6 +1122,39 @@ func TestGrepTool(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// System-prompt resolution.
+// ---------------------------------------------------------------------------
+
+// TestResolveSystemPrompt pins the fallback for callers that make the
+// standing instructions configurable: unset or blank means nemo's
+// default, anything else passes through, and both come out grounded
+// with workspace facts.
+func TestResolveSystemPrompt(t *testing.T) {
+	def := ResolveSystemPrompt("")
+	if !strings.HasPrefix(def, DefaultSystemPrompt) {
+		t.Errorf("empty base should use DefaultSystemPrompt, got %.80q...", def)
+	}
+	if blank := ResolveSystemPrompt(" \n\t"); blank != def {
+		t.Errorf("blank base should match empty base, got %.80q...", blank)
+	}
+
+	custom := ResolveSystemPrompt("You are terse.")
+	if !strings.HasPrefix(custom, "You are terse.") {
+		t.Errorf("custom base should pass through, got %.80q...", custom)
+	}
+	if strings.Contains(custom, DefaultSystemPrompt) {
+		t.Error("custom base should replace, not append, DefaultSystemPrompt")
+	}
+
+	for name, p := range map[string]string{"default": def, "custom": custom} {
+		if !strings.Contains(p, "\n\nCurrent working directory: ") ||
+			!strings.Contains(p, "\nPlatform: ") || !strings.Contains(p, "\nDate: ") {
+			t.Errorf("%s prompt lacks workspace grounding: %.120q...", name, p)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // buildRequestBody (Agent request assembly).
 // ---------------------------------------------------------------------------
 
@@ -1231,7 +1264,7 @@ func TestSpikeToolImageTransport(t *testing.T) {
 		APIKey:       apiKey,
 		Model:        model,
 		Tools:        DefaultTools(DefaultImageURL),
-		SystemPrompt: SystemPrompt,
+		SystemPrompt: DefaultSystemPrompt,
 	}
 	var reply strings.Builder
 	err = ag.Run(context.Background(), s,

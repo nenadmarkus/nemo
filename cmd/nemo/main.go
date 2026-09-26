@@ -3,8 +3,10 @@
 // output, and tool activity, and applies the workspace tools in the
 // current directory. Model and endpoint come from a flat JSON config
 // passed with -config: either a path to a JSON file or the JSON text
-// itself; the flag is required, and there are no implicit defaults.
-// Ctrl+C aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
+// itself; the flag is required, and there are no implicit defaults. An
+// optional system_prompt field in the config replaces nemo's default
+// standing instructions; when it is empty, the default applies. Ctrl+C
+// aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
 // nemo runs one shot instead: the string is a path to an instruction file
 // if it exists on disk, otherwise the instruction text itself; a single
 // turn runs and the process exits.
@@ -40,12 +42,13 @@ import (
 // ---------------------------------------------------------------------------
 
 type config struct {
-	BaseURL     string         `json:"base_url"` // e.g. "https://api.openai.com/v1"
-	Model       string         `json:"model"`
-	APIKey      string         `json:"api_key"`
-	Provider    map[string]any `json:"provider"`    // routing hints
-	Temperature *float64       `json:"temperature"` // nil = provider default
-	MaxTokens   int            `json:"max_tokens"`  // 0 = provider default
+	BaseURL      string         `json:"base_url"`      // e.g. "https://api.openai.com/v1"
+	Model        string         `json:"model"`
+	APIKey       string         `json:"api_key"`
+	Provider     map[string]any `json:"provider"`      // routing hints
+	Temperature  *float64       `json:"temperature"`   // nil = provider default
+	MaxTokens    int            `json:"max_tokens"`    // 0 = provider default
+	SystemPrompt string         `json:"system_prompt"` // "" = nemo's default standing instructions
 }
 
 // loadConfig parses the -config value: a path to a JSON config file if one
@@ -82,7 +85,7 @@ func buildAgent(cfg config) *nemo.Agent {
 		Provider:     cfg.Provider,
 		Temperature:  cfg.Temperature,
 		MaxTokens:    cfg.MaxTokens,
-		SystemPrompt: nemo.GroundedPrompt(nemo.SystemPrompt),
+		SystemPrompt: nemo.ResolveSystemPrompt(cfg.SystemPrompt),
 	}
 }
 
@@ -318,6 +321,9 @@ func main() {
 
 	fmt.Println("nemo: turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl-D to quit)")
 	fmt.Printf("nemo: model=%s base=%s\n", root.Model, root.Endpoint)
+	if strings.TrimSpace(cfg.SystemPrompt) != "" {
+		fmt.Println("nemo: custom system prompt in effect")
+	}
 
 	// stdin is read from a goroutine so the prompt can select on input
 	// and signals at once.

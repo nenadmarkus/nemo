@@ -122,15 +122,16 @@ const (
 tool defs
 */
 
-// SystemPrompt is nemo's standing instruction to the model.
-const SystemPrompt = "You are an expert coding assistant operating inside `nemo`, a coding agent harness. " +
-	"You help users by reading files, executing commands, editing code, and writing new files.\n\n" +
+// nemo's default standing instruction to the model.
+const DefaultSystemPrompt = "You are an expert assistant operating inside `nemo`, a minimal yet capable agent harness. " +
+	"You help users by doing research, reading files, executing commands, editing code, and writing new files.\n\n" +
 	"Guidelines:\n" +
 	"* be minimal and brief\n" +
+	"* take action with available tools rather than merely describing what the user could do\n" +
 	"* show file paths clearly when working with files\n" +
 	"* be mindful with destructive and irreversible actions\n" +
 	"* when several tool calls are independent, issue them all in one message so they run in parallel\n" +
-	"* ask the user to clarify intent if there is uncertainty"
+	"* ask the user to clarify only when their intent is materially uncertain"
 
 // GroundedPrompt appends workspace facts (cwd, platform, today's date) to
 // the base instructions so the model knows where and when it operates.
@@ -144,6 +145,18 @@ func GroundedPrompt(base string) string {
 		"\n\nCurrent working directory: " + cwd +
 		"\nPlatform: " + runtime.GOOS + "/" + runtime.GOARCH +
 		"\nDate: " + time.Now().Format("Monday, January 2, 2006")
+}
+
+// ResolveSystemPrompt returns the system prompt to run with: base when it
+// carries actual text, nemo's DefaultSystemPrompt otherwise, grounded with
+// workspace facts either way. Callers that let the standing instructions
+// be configured can pass their value through unchanged and get the default
+// for free when it is unset (or blank).
+func ResolveSystemPrompt(base string) string {
+	if strings.TrimSpace(base) == "" {
+		base = DefaultSystemPrompt
+	}
+	return GroundedPrompt(base)
 }
 
 // Tool is a function the model may call; ctx carries the run's deadline

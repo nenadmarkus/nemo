@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"golang.org/x/image/webp"
+
+	"nemo"
 )
 
 // gradientPNG renders a w×h PNG with pixel-varying content so WebP has
@@ -109,7 +111,7 @@ func TestLoadConfig(t *testing.T) {
 	temp := 0.5
 	filePath := writeTemp(t, "config.json", []byte(
 		`{"base_url":"http://file","model":"file-model","api_key":"file-key",`+
-			`"temperature":0.5,"max_tokens":128}`))
+			`"system_prompt":"file prompt","temperature":0.5,"max_tokens":128}`))
 
 	tests := []struct {
 		name    string
@@ -122,7 +124,7 @@ func TestLoadConfig(t *testing.T) {
 			value: filePath,
 			want: config{
 				BaseURL: "http://file", Model: "file-model", APIKey: "file-key",
-				Temperature: &temp, MaxTokens: 128,
+				SystemPrompt: "file prompt", Temperature: &temp, MaxTokens: 128,
 			},
 		},
 		{
@@ -134,6 +136,11 @@ func TestLoadConfig(t *testing.T) {
 			name:  "inline JSON with surrounding whitespace",
 			value: "\n\t {\"model\":\"ws-model\"} \n",
 			want:  config{Model: "ws-model"},
+		},
+		{
+			name:  "inline JSON with system prompt",
+			value: `{"model":"m","system_prompt":"You are terse."}`,
+			want:  config{Model: "m", SystemPrompt: "You are terse."},
 		},
 		{
 			name:  "inline empty object",
@@ -175,5 +182,32 @@ func TestLoadConfig(t *testing.T) {
 				t.Errorf("loadConfig(%q) = %+v, want %+v", tt.value, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestBuildAgentSystemPrompt checks the config → agent system-prompt
+// wiring: an unset (or blank) config keeps nemo's grounded default, a
+// configured prompt replaces it — grounded either way.
+func TestBuildAgentSystemPrompt(t *testing.T) {
+	def := buildAgent(config{}).SystemPrompt
+	if !strings.HasPrefix(def, nemo.DefaultSystemPrompt) {
+		t.Errorf("empty config should fall back to DefaultSystemPrompt, got %.80q...", def)
+	}
+	if got := buildAgent(config{SystemPrompt: " \n\t"}).SystemPrompt; got != def {
+		t.Errorf("blank config prompt should match the default, got %.80q...", got)
+	}
+
+	custom := buildAgent(config{SystemPrompt: "You are terse."}).SystemPrompt
+	if !strings.HasPrefix(custom, "You are terse.") {
+		t.Errorf("configured prompt should be used, got %.80q...", custom)
+	}
+	if strings.Contains(custom, nemo.DefaultSystemPrompt) {
+		t.Error("configured prompt should replace the default, not append it")
+	}
+
+	for name, p := range map[string]string{"default": def, "custom": custom} {
+		if !strings.Contains(p, "\n\nCurrent working directory: ") || !strings.Contains(p, "\nPlatform: ") {
+			t.Errorf("%s system prompt lacks workspace grounding: %.120q...", name, p)
+		}
 	}
 }
