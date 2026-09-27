@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -174,88 +173,24 @@ type Tool struct {
 	Handler  func(ctx context.Context, args map[string]any) (string, error)
 }
 
-// gitignoreRule is one parsed .gitignore line.
-type gitignoreRule struct {
-	negate   bool   // !pattern re-includes
-	dirOnly  bool   // trailing slash: matches directories only
-	anchored bool   // pattern is rooted at the walk root
-	pattern  string // slash-separated glob (* and ? do not cross /)
-}
+// PathFilter decides which paths a tree walk visits: rel is the path
+// relative to the walk root (in the host's separator form), isDir
+// distinguishes directories from files, and a false return excludes the
+// path — a rejected directory takes its whole subtree with it. A nil
+// PathFilter admits everything.
+type PathFilter func(rel string, isDir bool) bool
 
-// gitignoreRules is the parsed contents of one .gitignore file. A nil
-// *gitignoreRules ignores nothing, so callers without a .gitignore need
-// no special casing.
-type gitignoreRules struct {
-	rules []gitignoreRule
-}
+// FilterFactory generates the PathFilter for a walk of root right before
+// it starts, so root-dependent policies (reading a config file at the
+// root, for instance) re-evaluate on every traversal. A nil
+// FilterFactory admits everything.
+type FilterFactory func(root string) PathFilter
 
-// parseGitignore parses the subset of .gitignore syntax nemo honors:
-// blank lines and # comments, trailing-slash directory patterns, a slash
-// anywhere in the pattern anchoring it to the ignore file's directory,
-// ! negation (last matching rule wins), and * ? [ ] globs that do not
-// cross "/". Escapes (\# and friends) and ** are not supported.
-func parseGitignore(data string) *gitignoreRules {
-	var g *gitignoreRules
-	for _, line := range strings.Split(data, "\n") {
-		line = strings.TrimRight(line, "\r ")
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		negate := strings.HasPrefix(line, "!")
-		if negate {
-			line = line[1:]
-		}
-		dirOnly := strings.HasSuffix(line, "/")
-		line = strings.TrimSuffix(line, "/")
-		anchored := strings.Contains(line, "/")
-		line = strings.TrimPrefix(line, "/")
-		if line == "" {
-			continue
-		}
-		if g == nil {
-			g = &gitignoreRules{}
-		}
-		g.rules = append(g.rules, gitignoreRule{
-			negate:   negate,
-			dirOnly:  dirOnly,
-			anchored: anchored,
-			pattern:  line,
-		})
-	}
-	return g
-}
-
-// ignored reports whether rel (a path relative to the walk root, in the
-// host's separator form) matches the rules; a nil receiver ignores nothing.
-func (g *gitignoreRules) ignored(rel string, isDir bool) bool {
-	if g == nil {
-		return false
-	}
-	rel = filepath.ToSlash(rel)
-	base := path.Base(rel)
-	ignored := false
-	for _, r := range g.rules {
-		if r.dirOnly && !isDir {
-			continue
-		}
-		var ok bool
-		if r.anchored {
-			ok, _ = path.Match(r.pattern, rel)
-		} else {
-			ok, _ = path.Match(r.pattern, base)
-		}
-		if ok {
-			ignored = !r.negate
-		}
-	}
-	return ignored
-}
-
-// walkTree walks root (a file or directory), calling fn for each file that
-// is not gitignored. Only the .gitignore at the walk root is honored
-// (nested .gitignore files are not), and the .git directory is always
-// skipped — unless it is the root itself. Unreadable entries are skipped.
-func walkTree(root string, fn func(path string)) error {
+// walkTree walks root (a file or directory), calling fn for each file
+// admitted by filter (nil admits everything). The filter sees every path
+// below the root — excluding a directory excludes its subtree — but never
+// the root itself. Unreadable entries are skipped.
+func walkTree(root string, filter PathFilter, fn func(path string)) error {
 	info, err := os.Stat(root)
 	if err != nil {
 		return err
@@ -263,10 +198,6 @@ func walkTree(root string, fn func(path string)) error {
 	if !info.IsDir() {
 		fn(root)
 		return nil
-	}
-	var rules *gitignoreRules
-	if data, err := os.ReadFile(filepath.Join(root, ".gitignore")); err == nil {
-		rules = parseGitignore(string(data))
 	}
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -276,13 +207,13 @@ func walkTree(root string, fn func(path string)) error {
 		if err != nil || rel == "." {
 			return nil
 		}
-		if d.IsDir() {
-			if d.Name() == ".git" || rules.ignored(rel, true) {
+		if filter != nil && !filter(rel, d.IsDir()) {
+			if d.IsDir() {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if rules.ignored(rel, false) {
+		if d.IsDir() {
 			return nil
 		}
 		fn(p)
@@ -880,11 +811,18 @@ func NewDeleteTool() Tool {
 	}
 }
 
-// NewGrepTool returns the regex content-search tool.
-func NewGrepTool() Tool {
+// NewGrepTool returns the regex content-search tool. filterFactory
+// generates the filter deciding which paths a search visits; nil searches
+// everything. Binary files are always skipped. The nemo command passes
+// its workspace filter factory; other domains supply their own.
+func NewGrepTool(filterFactory FilterFactory) Tool {
+	skipped := "binary files are skipped"
+	if filterFactory != nil {
+		skipped = "binary files and filtered paths are skipped"
+	}
 	return Tool{
 		Name:        "grep",
-		Description: "search file contents for a regex; returns matching lines as path:line: text; binary files and gitignored paths are skipped",
+		Description: "search file contents for a regex; returns matching lines as path:line: text; " + skipped,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -910,8 +848,12 @@ func NewGrepTool() Tool {
 			if p, ok := args["path"].(string); ok && p != "" {
 				root = p
 			}
+			var pf PathFilter
+			if filterFactory != nil {
+				pf = filterFactory(root)
+			}
 			var out []string
-			err = walkTree(root, func(path string) {
+			err = walkTree(root, pf, func(path string) {
 				if len(out) >= 100 {
 					return
 				}
@@ -952,11 +894,18 @@ func NewGrepTool() Tool {
 	}
 }
 
-// NewFindTool returns the glob file-finding tool.
-func NewFindTool() Tool {
+// NewFindTool returns the glob file-finding tool. filterFactory generates
+// the filter deciding which paths a search visits; nil searches
+// everything. The nemo command passes its workspace filter factory;
+// other domains supply their own.
+func NewFindTool(filterFactory FilterFactory) Tool {
+	skipped := ""
+	if filterFactory != nil {
+		skipped = "; filtered paths are skipped"
+	}
 	return Tool{
 		Name:        "find",
-		Description: "find files whose name or path matches a glob pattern (e.g. *.go, **/*_test.go); gitignored paths are skipped",
+		Description: "find files whose name or path matches a glob pattern (e.g. *.go, **/*_test.go)" + skipped,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -979,8 +928,12 @@ func NewFindTool() Tool {
 				ok, err := filepath.Match(pat, name)
 				return err == nil && ok
 			}
+			var pf PathFilter
+			if filterFactory != nil {
+				pf = filterFactory(root)
+			}
 			var out []string
-			err := walkTree(root, func(p string) {
+			err := walkTree(root, pf, func(p string) {
 				if len(out) >= 1000 {
 					return
 				}
@@ -1047,18 +1000,20 @@ func NewLsTool() Tool {
 }
 
 // DefaultTools returns nemo's standard tool set, wiring the image
-// transport into read; imageURL may be nil (attachments disabled).
+// transport into read and the filter factory into grep and find. imageURL
+// may be nil (attachments disabled), filterFactory nil (search
+// everything); the nemo command passes its workspace filter factory.
 // Embedders wanting a subset (or none) of these tools compose the
 // New*Tool constructors, or their own, into Agent.Tools directly.
-func DefaultTools(imageURL ImageTransport) []Tool {
+func DefaultTools(imageURL ImageTransport, filterFactory FilterFactory) []Tool {
 	return []Tool{
 		NewFetchTool(),
 		NewReadTool(imageURL),
 		NewWriteTool(),
 		NewEditTool(),
 		NewDeleteTool(),
-		NewGrepTool(),
-		NewFindTool(),
+		NewGrepTool(filterFactory),
+		NewFindTool(filterFactory),
 		NewLsTool(),
 	}
 }

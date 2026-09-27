@@ -125,55 +125,13 @@ func TestTruncateUTF8(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// parseGitignore / gitignoreRules.ignored.
-// ---------------------------------------------------------------------------
-
-func TestParseGitignore(t *testing.T) {
-	data := "# comment\n\n" +
-		"*.log\n" +
-		"!keep.log\n" +
-		"build/\n" +
-		"/docs\n" +
-		"data?\n"
-	g := parseGitignore(data)
-
-	tests := []struct {
-		rel   string
-		isDir bool
-		want  bool
-	}{
-		{"x.log", false, true},
-		{"dir/x.log", false, true},      // unanchored globs match at any depth
-		{"keep.log", false, false},      // ! negation, last match wins
-		{"build", true, true},           // trailing slash: dirs only
-		{"build", false, false},         // ... so a file named build survives
-		{"a/build", true, true},         // unanchored dir pattern matches nested
-		{"docs", true, true},            // anchored
-		{"docs/file.txt", false, false}, // anchored patterns cover only the exact path (simplified parser)
-		{"data1", false, true},          // ? matches one char
-		{"data12", false, false},
-	}
-	for _, tt := range tests {
-		if got := g.ignored(tt.rel, tt.isDir); got != tt.want {
-			t.Errorf("ignored(%q, isDir=%v) = %v, want %v", tt.rel, tt.isDir, got, tt.want)
-		}
-	}
-
-	// Comment-only input parses to nil rules, which ignore nothing.
-	if g := parseGitignore("# only comments\n\n"); g != nil {
-		t.Errorf("parseGitignore of comment-only input = %v, want nil", g)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // walkTree.
 // ---------------------------------------------------------------------------
 
 func TestWalkTree(t *testing.T) {
 	tmp := t.TempDir()
-	mustWrite(t, filepath.Join(tmp, ".gitignore"), "*.log\nsub/\n")
 	mustWrite(t, filepath.Join(tmp, "a.go"), "package a")
-	mustWrite(t, filepath.Join(tmp, "b.log"), "ignored")
+	mustWrite(t, filepath.Join(tmp, "b.log"), "data")
 	mustWrite(t, filepath.Join(tmp, "keep.txt"), "kept")
 	mustMkdir(t, filepath.Join(tmp, ".git"))
 	mustWrite(t, filepath.Join(tmp, ".git", "config"), "[core]")
@@ -181,28 +139,45 @@ func TestWalkTree(t *testing.T) {
 	mustWrite(t, filepath.Join(tmp, "sub", "c.go"), "package c")
 
 	var names []string
-	err := walkTree(tmp, func(p string) {
+	collect := func(p string) {
 		rel, err := filepath.Rel(tmp, p)
 		if err != nil {
 			t.Fatal(err)
 		}
 		names = append(names, filepath.ToSlash(rel))
-	})
+	}
+
+	// A nil filter walks every file, including those inside .git
+	// (directories themselves are never yielded, only descended).
+	err := walkTree(tmp, nil, collect)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sort.Strings(names)
-
-	// .git is always skipped, b.log and sub/ are gitignored; the root
-	// .gitignore itself is walked like any other file.
-	want := []string{".gitignore", "a.go", "keep.txt"}
+	want := []string{".git/config", "a.go", "b.log", "keep.txt", "sub/c.go"}
 	if !reflect.DeepEqual(names, want) {
-		t.Errorf("walkTree collected %v, want %v", names, want)
+		t.Errorf("walkTree (nil filter) collected %v, want %v", names, want)
 	}
 
-	// A file root yields just that file.
+	// A custom filter sees root-relative paths: rejecting the .git
+	// directory prunes its whole subtree, rejecting *.log skips plain
+	// files. (The nemo command's gitFilter is exactly this shape; it
+	// lives in cmd/nemo with its own tests.)
 	names = nil
-	if err := walkTree(filepath.Join(tmp, "a.go"), func(p string) { names = append(names, p) }); err != nil {
+	if err := walkTree(tmp, func(rel string, isDir bool) bool {
+		return !(isDir && filepath.Base(rel) == ".git") && !strings.HasSuffix(rel, ".log")
+	}, collect); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(names)
+	want = []string{"a.go", "keep.txt", "sub/c.go"}
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("walkTree (custom filter) collected %v, want %v", names, want)
+	}
+
+	// A file root yields just that file; the filter never sees it.
+	names = nil
+	if err := walkTree(filepath.Join(tmp, "a.go"), nil, func(p string) { names = append(names, p) }); err != nil {
 		t.Fatal(err)
 	}
 	if len(names) != 1 || names[0] != filepath.Join(tmp, "a.go") {
@@ -673,7 +648,7 @@ func TestProcessToolCallsImageAttachment(t *testing.T) {
 
 func toolByName(t *testing.T, name string) Tool {
 	t.Helper()
-	for _, tt := range DefaultTools(nil) {
+	for _, tt := range DefaultTools(nil, nil) {
 		if tt.Name == name {
 			return tt
 		}
@@ -1052,11 +1027,9 @@ func TestLsTool(t *testing.T) {
 func TestFindTool(t *testing.T) {
 	tool := toolByName(t, "find")
 	tmp := t.TempDir()
-	mustWrite(t, filepath.Join(tmp, ".gitignore"), "*.log\n")
 	mustWrite(t, filepath.Join(tmp, "x.go"), "package x")
 	mustMkdir(t, filepath.Join(tmp, "sub"))
 	mustWrite(t, filepath.Join(tmp, "sub", "y.go"), "package y")
-	mustWrite(t, filepath.Join(tmp, "z.log"), "ignored")
 
 	out, err := callTool(t, tool, map[string]any{"pattern": "*.go", "path": tmp})
 	if err != nil {
@@ -1075,7 +1048,7 @@ func TestFindTool(t *testing.T) {
 		t.Errorf("find **/*.go = %q, want %q", out, want)
 	}
 
-	// Gitignored files are not found.
+	// No .log files exist anywhere in the tree.
 	out, err = callTool(t, tool, map[string]any{"pattern": "*.log", "path": tmp})
 	if err != nil {
 		t.Fatal(err)
@@ -1088,9 +1061,7 @@ func TestFindTool(t *testing.T) {
 func TestGrepTool(t *testing.T) {
 	tool := toolByName(t, "grep")
 	tmp := t.TempDir()
-	mustWrite(t, filepath.Join(tmp, ".gitignore"), "*.log\n")
 	mustWrite(t, filepath.Join(tmp, "a.txt"), "hello world\nHELLO again\nbye\n")
-	mustWrite(t, filepath.Join(tmp, "b.log"), "hello in ignored file")
 	mustWrite(t, filepath.Join(tmp, "bin.dat"), "\x00hello") // binary: skipped
 
 	a := filepath.Join(tmp, "a.txt")
@@ -1263,7 +1234,7 @@ func TestSpikeToolImageTransport(t *testing.T) {
 		Endpoint:     "https://openrouter.ai/api/v1/chat/completions",
 		APIKey:       apiKey,
 		Model:        model,
-		Tools:        DefaultTools(DefaultImageURL),
+		Tools:        DefaultTools(DefaultImageURL, nil),
 		SystemPrompt: DefaultSystemPrompt,
 	}
 	var reply strings.Builder
