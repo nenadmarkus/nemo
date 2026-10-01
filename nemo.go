@@ -11,12 +11,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -999,6 +1001,101 @@ func NewLsTool() Tool {
 	}
 }
 
+// ExecResult is the exec tool's output.
+type ExecResult struct {
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exit_code"`
+}
+
+// shellCommand builds the platform shell invocation for command:
+// powershell.exe on Windows, plain sh elsewhere. -NoProfile keeps
+// PowerShell from loading startup scripts; -NonInteractive stops it
+// from blocking on prompts.
+func shellCommand(ctx context.Context, command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.CommandContext(ctx,
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			command,
+		)
+	}
+
+	return exec.CommandContext(ctx, "sh", "-c", command)
+}
+
+// NewExecTool returns the shell-execution tool: one command under the
+// platform shell (sh on Unix, powershell.exe on Windows) with an
+// optional timeout (default 30s, further capped by
+// the run context's own deadline). The result — stdout, stderr, and
+// exit code as JSON — is a successful tool result even on a nonzero
+// exit, so the model can see the failure and react; timeouts and spawn
+// failures come back as errors.
+func NewExecTool() Tool {
+	return Tool{
+		Name:        "exec",
+		Description: "execute a shell command (sh on unix, powershell on windows) and return stdout, stderr, and the exit code",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command":    map[string]any{"type": "string", "description": "shell command to run"},
+				"timeout_ms": map[string]any{"type": "integer", "description": "timeout in milliseconds (default 30000)"},
+			},
+			"required": []string{"command"},
+		},
+		// Mutating: a command can change state, so within one batch exec
+		// calls run inline in issue order instead of racing other calls.
+		Mutating: true,
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			command, _ := args["command"].(string)
+			if command == "" {
+				return "", fmt.Errorf("command is required")
+			}
+
+			timeout := 30 * time.Second
+			if t, ok := args["timeout_ms"].(float64); ok && t > 0 {
+				timeout = time.Duration(t) * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			cmd := shellCommand(ctx, command)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			err := cmd.Run()
+
+			exitCode := 0
+			if err != nil {
+				// CommandContext kills the process on expiry, and that
+				// surfaces as an ExitError; check the context first so
+				// timeouts read as timeouts, not as nonzero exits.
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					return "", err
+				}
+				exitCode = exitErr.ExitCode()
+			}
+
+			out, err := json.Marshal(ExecResult{
+				Stdout:   stdout.String(),
+				Stderr:   stderr.String(),
+				ExitCode: exitCode,
+			})
+			if err != nil {
+				return "", err
+			}
+			return string(out), nil
+		},
+	}
+}
+
 // DefaultTools returns nemo's standard tool set, wiring the image
 // transport into read and the filter factory into grep and find. imageURL
 // may be nil (attachments disabled), filterFactory nil (search
@@ -1015,6 +1112,7 @@ func DefaultTools(imageURL ImageTransport, filterFactory FilterFactory) []Tool {
 		NewGrepTool(filterFactory),
 		NewFindTool(filterFactory),
 		NewLsTool(),
+		NewExecTool(),
 	}
 }
 
