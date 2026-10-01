@@ -2,6 +2,10 @@
 go run cmd/nemo/main.go --config "$(cat ~/.nemo/config.json)" --task "read table.png and transform it into markdown"
 ```
 
+## Containerization
+
+`docker build -t nemo .`
+
 ```
 docker run --rm -it \
   --network=bridge \
