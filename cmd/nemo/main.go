@@ -48,7 +48,7 @@ import (
 // ---------------------------------------------------------------------------
 
 type config struct {
-	BaseURL      string         `json:"base_url"`      // e.g. "https://api.openai.com/v1"
+	BaseURL      string         `json:"base_url"` // e.g. "https://api.openai.com/v1"
 	Model        string         `json:"model"`
 	APIKey       string         `json:"api_key"`
 	Provider     map[string]any `json:"provider"`      // routing hints

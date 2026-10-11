@@ -96,11 +96,11 @@ func TestGitFilter(t *testing.T) {
 	}{
 		{"a.go", false, true},
 		{"dir/a.go", false, true},
-		{"x.log", false, false},     // gitignored
-		{"dir/x.log", false, false}, // unanchored glob matches at any depth
-		{"keep.log", false, true},   // ! negation
-		{"sub", true, false},        // trailing slash: dir ignored...
-		{"sub/c.go", false, true},   // ...its subtree is pruned by the walk, not the rule
+		{"x.log", false, false},      // gitignored
+		{"dir/x.log", false, false},  // unanchored glob matches at any depth
+		{"keep.log", false, true},    // ! negation
+		{"sub", true, false},         // trailing slash: dir ignored...
+		{"sub/c.go", false, true},    // ...its subtree is pruned by the walk, not the rule
 		{".git", true, false},        // .git always skipped...
 		{"nested/.git", true, false}, // ...wherever it appears
 	}

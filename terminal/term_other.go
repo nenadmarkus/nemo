@@ -16,7 +16,9 @@ type Terminal struct{}
 func Probe(f *os.File) bool { return false }
 
 // Open is unavailable on this platform.
-func Open() (*Terminal, error) { return nil, errors.New("terminal support unavailable on this platform") }
+func Open() (*Terminal, error) {
+	return nil, errors.New("terminal support unavailable on this platform")
+}
 
 // Restore is a no-op.
 func (t *Terminal) Restore() {}

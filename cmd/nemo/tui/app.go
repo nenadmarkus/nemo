@@ -37,10 +37,10 @@ type ui struct {
 	quit    chan struct{}
 	width   int
 
-	cur    *block   // open streaming block (thinking/output)
-	tools  []*block // open tool blocks
-	dirty  bool
-	spin   int
+	cur   *block   // open streaming block (thinking/output)
+	tools []*block // open tool blocks
+	dirty bool
+	spin  int
 
 	running   bool
 	unwinding bool

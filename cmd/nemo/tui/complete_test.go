@@ -32,12 +32,12 @@ func TestFileCompleterSuffixes(t *testing.T) {
 		token string
 		want  []string
 	}{
-		{"sr", []string{"c/"}},                            // dir suffix
-		{"readme.m", []string{"d"}},                       // file suffix
+		{"sr", []string{"c/"}},                           // dir suffix
+		{"readme.m", []string{"d"}},                      // file suffix
 		{"", []string{"./", "../", "src/", "readme.md"}}, // empty token: cwd listing
-		{"ex", []string{"it"}},                         // first-word command
-		{"z", nil},                                     // no match
-		{filepath.ToSlash(dir) + "/sr", []string{"c/"}}, // explicit path prefix
+		{"ex", []string{"it"}},                           // first-word command
+		{"z", nil},                                       // no match
+		{filepath.ToSlash(dir) + "/sr", []string{"c/"}},  // explicit path prefix
 	}
 	for _, tt := range tests {
 		if got := c.Complete(tt.token, len(tt.token)); !reflect.DeepEqual(got, tt.want) {
