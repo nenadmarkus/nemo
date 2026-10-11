@@ -73,27 +73,41 @@ func TestEditorWideCursor(t *testing.T) {
 func TestEditorCompletion(t *testing.T) {
 	e := NewEditor(fakeCompleter{[]string{"c/", "cc/"}})
 	e.Insert("sr")
-	e.Key(Key{Name: KeyTab}) // multiple: insert lcp "c", keep ghost list
+	e.Key(Key{Name: KeyTab}) // first tab: insert lcp "c", list candidates
 	if got := e.Text(); got != "src" {
 		t.Fatalf("text = %q, want %q", got, "src")
 	}
-	if len(e.Pending()) != 2 {
-		t.Fatalf("pending = %v", e.Pending())
-	}
-	// The ghost shows full continuations, not raw suffixes.
 	if got := e.Pending(); got[0] != "src/" || got[1] != "srcc/" {
 		t.Fatalf("pending = %v, want [src/ srcc/]", got)
 	}
-	e.Key(Key{Name: KeyRune, R: 'x'}) // any other key clears the ghost
+	e.Key(Key{Name: KeyTab}) // second tab: prefill the first option
+	if got := e.Text(); got != "src/" {
+		t.Fatalf("after cycle 1 = %q, want src/", got)
+	}
+	if got := e.Pending(); got[0] != "src/ ←" {
+		t.Fatalf("pending = %v, want first marked", got)
+	}
+	e.Key(Key{Name: KeyTab}) // third tab: switch to the next one
+	if got := e.Text(); got != "srcc/" {
+		t.Fatalf("after cycle 2 = %q, want srcc/", got)
+	}
+	e.Key(Key{Name: KeyTab}) // wraps around
+	if got := e.Text(); got != "src/" {
+		t.Fatalf("after cycle 3 = %q, want src/ (wrapped)", got)
+	}
+	e.Key(Key{Name: KeyRune, R: 'x'}) // any other key clears the state
 	if len(e.Pending()) != 0 {
 		t.Fatal("pending should clear on non-tab key")
 	}
 
 	e2 := NewEditor(fakeCompleter{[]string{"c/"}})
 	e2.Insert("sr")
-	e2.Key(Key{Name: KeyTab}) // single: insert it
+	e2.Key(Key{Name: KeyTab}) // single: insert it, no cycle state
 	if got := e2.Text(); got != "src/" {
 		t.Fatalf("text = %q, want %q", got, "src/")
+	}
+	if len(e2.Pending()) != 0 {
+		t.Fatal("single candidate must not open a cycle")
 	}
 }
 

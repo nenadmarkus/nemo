@@ -25,8 +25,9 @@ type Editor struct {
 	hIdx      int // len(history) = live draft
 	draft     string
 	paste     bool
-	pending   []string // completion candidates (suffixes) for the ghost line
-	pendTok   string   // the token the candidates were computed for
+	pending   []string // full candidate names for cycling + the ghost line
+	tokStart  int      // rune index where the candidates' token starts
+	pendIdx   int      // candidate chosen by cycling (-1 = lcp only)
 	completer Completer
 }
 
@@ -87,15 +88,17 @@ func (e *Editor) Add(line string) {
 }
 
 // Pending returns the current completion candidates for the ghost
-// line, reconstructed to full continuations (typed token + suffix) so
-// they read like real names, shell-style.
+// line, as full continuations; the one selected by cycling is marked.
 func (e *Editor) Pending() []string {
 	if len(e.pending) == 0 {
 		return nil
 	}
 	out := make([]string, len(e.pending))
 	for i, c := range e.pending {
-		out[i] = e.pendTok + c
+		if i == e.pendIdx {
+			c += " ←"
+		}
+		out[i] = c
 	}
 	return out
 }
@@ -269,11 +272,17 @@ func wrapTrack(text string, width, cur int, track bool) (segs []string, seg, cel
 	return append(segs, string(line)), seg, cell
 }
 
-// complete runs Tab completion for the token left of the cursor: one
-// candidate inserts it, several insert the longest common prefix and keep
-// the list for the ghost line.
+// complete runs Tab completion for the token left of the cursor. The
+// first Tab inserts the longest common prefix and lists the candidates;
+// every further Tab replaces the token with the next full candidate in
+// turn (wrapping), readline-style. Any other key restarts the cycle.
 func (e *Editor) complete() {
 	if e.completer == nil {
+		return
+	}
+	if e.pending != nil {
+		e.pendIdx = (e.pendIdx + 1) % len(e.pending)
+		e.replaceToken(e.tokStart, e.pending[e.pendIdx])
 		return
 	}
 	tokStart := e.cur
@@ -283,20 +292,32 @@ func (e *Editor) complete() {
 		}
 		tokStart--
 	}
+	token := string(e.buf[tokStart:e.cur])
 	cands := e.completer.Complete(string(e.buf), e.cur)
-	switch {
-	case len(cands) == 0:
-		e.pending = nil
-	case len(cands) == 1:
-		e.Insert(cands[0])
-		e.pending = nil
-	default:
-		e.pendTok = string(e.buf[tokStart:e.cur])
-		if lcp := commonPrefix(cands); lcp != "" {
-			e.Insert(lcp)
+	if len(cands) <= 1 {
+		if len(cands) == 1 {
+			e.Insert(cands[0])
 		}
-		e.pending = cands
+		return
 	}
+	fulls := make([]string, len(cands))
+	for i, c := range cands {
+		fulls[i] = token + c
+	}
+	e.tokStart = tokStart
+	e.pending = fulls
+	e.pendIdx = -1
+	if lcp := commonPrefix(cands); lcp != "" {
+		e.Insert(lcp)
+	}
+}
+
+// replaceToken replaces the buffer range [start, cur) with s.
+func (e *Editor) replaceToken(start int, s string) {
+	rs := []rune(s)
+	tail := append([]rune{}, e.buf[e.cur:]...)
+	e.buf = append(e.buf[:start], append(rs, tail...)...)
+	e.cur = start + len(rs)
 }
 
 func commonPrefix(cands []string) string {
