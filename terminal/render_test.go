@@ -1,9 +1,24 @@
 package terminal
 
 import (
+	"bytes"
 	"regexp"
+	"strings"
 	"testing"
 )
+
+func TestPainterClearScreen(t *testing.T) {
+	var b bytes.Buffer
+	p := NewPainter(&b)
+	p.Repaint([]string{"a", "b"})
+	b.Reset()
+	p.ClearScreen()
+	p.Repaint([]string{"c"})
+	out := b.String()
+	if !strings.Contains(out, "\x1b[2J") || strings.Contains(out, "\x1b[1A") {
+		t.Fatalf("after clear-screen repaint = %q", out)
+	}
+}
 
 var ansi = regexp.MustCompile("\x1b\\[[0-9;?]*[A-Za-z]")
 

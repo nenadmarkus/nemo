@@ -60,6 +60,14 @@ func (p *Painter) Repaint(lines []string) {
 	io.WriteString(p.w, b.String())
 }
 
+// ClearScreen erases the whole screen, homes the cursor, and restarts
+// the owned region at the top line (Ctrl-L: transcript gone, prompt
+// stays).
+func (p *Painter) ClearScreen() {
+	io.WriteString(p.w, "\x1b[H\x1b[2J")
+	p.owned = 0
+}
+
 // Cursor shows the cursor at row/col (0-based; col in display cells)
 // within the owned region. Must follow a Repaint.
 func (p *Painter) Cursor(row, col int) {

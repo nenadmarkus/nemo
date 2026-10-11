@@ -133,6 +133,11 @@ func (u *ui) onKey(k terminal.Key) {
 	case k.Name == terminal.KeyRune && k.Ctrl && k.R == 'd' && u.ed.Empty():
 		u.exiting = true
 		return
+	case k.Name == terminal.KeyRune && k.Ctrl && k.R == 'l':
+		// Clear the screen but keep the prompt (and any streaming state).
+		u.p.ClearScreen()
+		u.repaint()
+		return
 	case k.Name == terminal.KeyEsc && u.running:
 		u.interrupt()
 		return
