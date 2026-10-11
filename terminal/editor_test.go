@@ -80,6 +80,10 @@ func TestEditorCompletion(t *testing.T) {
 	if len(e.Pending()) != 2 {
 		t.Fatalf("pending = %v", e.Pending())
 	}
+	// The ghost shows full continuations, not raw suffixes.
+	if got := e.Pending(); got[0] != "src/" || got[1] != "srcc/" {
+		t.Fatalf("pending = %v, want [src/ srcc/]", got)
+	}
 	e.Key(Key{Name: KeyRune, R: 'x'}) // any other key clears the ghost
 	if len(e.Pending()) != 0 {
 		t.Fatal("pending should clear on non-tab key")

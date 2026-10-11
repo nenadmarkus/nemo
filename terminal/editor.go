@@ -25,7 +25,8 @@ type Editor struct {
 	hIdx      int // len(history) = live draft
 	draft     string
 	paste     bool
-	pending   []string // completion candidates for the ghost line
+	pending   []string // completion candidates (suffixes) for the ghost line
+	pendTok   string   // the token the candidates were computed for
 	completer Completer
 }
 
@@ -85,8 +86,19 @@ func (e *Editor) Add(line string) {
 	e.hIdx = len(e.history)
 }
 
-// Pending returns the current completion candidates for the ghost line.
-func (e *Editor) Pending() []string { return e.pending }
+// Pending returns the current completion candidates for the ghost
+// line, reconstructed to full continuations (typed token + suffix) so
+// they read like real names, shell-style.
+func (e *Editor) Pending() []string {
+	if len(e.pending) == 0 {
+		return nil
+	}
+	out := make([]string, len(e.pending))
+	for i, c := range e.pending {
+		out[i] = e.pendTok + c
+	}
+	return out
+}
 
 // Key applies one keypress, returning true when the buffer should be
 // submitted (the caller reads Text, then calls Reset).
@@ -279,6 +291,7 @@ func (e *Editor) complete() {
 		e.Insert(cands[0])
 		e.pending = nil
 	default:
+		e.pendTok = string(e.buf[tokStart:e.cur])
 		if lcp := commonPrefix(cands); lcp != "" {
 			e.Insert(lcp)
 		}

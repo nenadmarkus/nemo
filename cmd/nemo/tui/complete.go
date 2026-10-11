@@ -68,10 +68,12 @@ func (fileCompleter) Complete(line string, cursor int) []string {
 			if !strings.HasPrefix(name, prefix) {
 				continue
 			}
+			// Candidates are the continuation beyond the typed prefix.
+			suffix := name[len(prefix):]
 			if e.IsDir() {
-				dirs = append(dirs, name+"/")
+				dirs = append(dirs, suffix+"/")
 			} else {
-				files = append(files, name)
+				files = append(files, suffix)
 			}
 		}
 	}
