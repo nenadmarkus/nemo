@@ -5,8 +5,10 @@
 // passed with -config: either a path to a JSON file or the JSON text
 // itself; the flag is required, and there are no implicit defaults. An
 // optional system_prompt field in the config replaces nemo's default
-// standing instructions; when it is empty, the default applies. Ctrl+C
-// aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
+// standing instructions; when it is empty, the default applies. When stdin
+// is a terminal nemo runs an interactive TUI (transcript plus live prompt);
+// -plain selects the line-based REPL, which is also the fallback for
+// non-tty use. Ctrl+C aborts the running turn; "exit" or Ctrl-D quits. With -task <string>
 // nemo runs one shot instead: the string is a path to an instruction file
 // if it exists on disk, otherwise the instruction text itself; a single
 // turn runs and the process exits.
@@ -37,6 +39,8 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"nemo"
+	"nemo/cmd/nemo/tui"
+	"nemo/terminal"
 )
 
 // ---------------------------------------------------------------------------
@@ -234,6 +238,7 @@ func main() {
 	configPath := flag.String("config", "", "path to a JSON config file, or the JSON config text itself")
 	task := flag.String("task", "", "one-shot mode: run a single instruction and exit; "+
 		"<string> is a path to an instruction file if it exists on disk, otherwise the instruction text itself")
+	plain := flag.Bool("plain", false, "use the plain line-based REPL instead of the TUI")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -243,6 +248,16 @@ func main() {
 	}
 
 	root := buildAgent(cfg)
+
+	// TUI when stdin is a terminal (and not -plain/-task); the plain REPL
+	// below stays the fallback for non-tty use and other platforms.
+	if *task == "" && !*plain && terminal.Probe(os.Stdin) {
+		if err := tui.Run(root); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// Stream callbacks: render reasoning/output/tool/system blocks, each
 	// starting on a fresh line with its own header so phases are unmistakable.
