@@ -465,10 +465,14 @@ func TestProcessToolCallsParallel(t *testing.T) {
 		ok                     bool
 	}
 	var got []report
+	var starts []report
 	var messages []map[string]any
 	done := make(chan struct{})
 	go func() {
 		processToolCalls(context.Background(), reg, calls,
+			func(callID, name, args string) {
+				starts = append(starts, report{id: callID, name: name, args: args})
+			},
 			func(callID, name, args string, ok bool, detail string) {
 				got = append(got, report{callID, name, args, detail, ok})
 			},
@@ -494,7 +498,16 @@ func TestProcessToolCallsParallel(t *testing.T) {
 		{"b", "r", `{"x":"b"}`, "done b", true},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("onTool reports = %v, want %v", got, want)
+		t.Errorf("onToolEnd reports = %v, want %v", got, want)
+	}
+	// Start callbacks fired for every call, in issue order, before any
+	// result came back (handlers were still parked on <-release).
+	wantStarts := []report{
+		{"a", "r", `{"x":"a"}`, "", false},
+		{"b", "r", `{"x":"b"}`, "", false},
+	}
+	if !reflect.DeepEqual(starts, wantStarts) {
+		t.Errorf("onToolStart reports = %v, want %v", starts, wantStarts)
 	}
 	// Tool messages appended in call order, ids paired in sequence.
 	if len(messages) != 2 ||
@@ -531,7 +544,7 @@ func TestProcessToolCallsMutatingSerialized(t *testing.T) {
 	}
 
 	var messages []map[string]any
-	processToolCalls(context.Background(), reg, calls, nil,
+	processToolCalls(context.Background(), reg, calls, nil, nil,
 		func(msg map[string]any) { messages = append(messages, msg) })
 
 	data, err := os.ReadFile(p)
@@ -570,7 +583,7 @@ func TestProcessToolCallsDisplayReplay(t *testing.T) {
 		batchCall("c2", "fast", "{}"),
 	}
 	var order []string
-	processToolCalls(ctx, reg, calls,
+	processToolCalls(ctx, reg, calls, nil,
 		func(callID, name, args string, ok bool, detail string) { order = append(order, callID) },
 		func(msg map[string]any) {})
 
@@ -578,7 +591,7 @@ func TestProcessToolCallsDisplayReplay(t *testing.T) {
 		t.Errorf("display order = %v, want %v", shown, want)
 	}
 	if want := []string{"c1", "c2"}; !reflect.DeepEqual(order, want) {
-		t.Errorf("onTool order = %v, want %v", order, want)
+		t.Errorf("onToolEnd order = %v, want %v", order, want)
 	}
 }
 
@@ -603,6 +616,7 @@ func TestProcessToolCallsImageAttachment(t *testing.T) {
 		batchCall("c1", "selfie", "{}"),
 		batchCall("c2", "plain", "{}"),
 	},
+		nil,
 		func(callID, name, args string, ok bool, detail string) {},
 		func(msg map[string]any) { msgs = append(msgs, msg) })
 
@@ -1243,6 +1257,7 @@ func TestSpikeToolImageTransport(t *testing.T) {
 		nil,
 		func(c string) { reply.WriteString(c) },
 		func(sys string) { t.Log("[system] " + sys) },
+		nil,
 		nil)
 	if err != nil {
 		t.Fatalf("endpoint rejected image-in-tool-message for %s: %v", model, err)

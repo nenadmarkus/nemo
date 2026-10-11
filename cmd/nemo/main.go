@@ -308,14 +308,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[system] %s\n", nemo.TruncateUTF8(oneLine, 1024, " ..."))
 	}
 
-	onTool := func(callID, name, args string, ok bool, detail string) {
+	onToolStart := func(callID, name, args string) {
 		label := name
 		if callID != "" {
 			label = callID + " " + name
 		}
+		// Each tool call is its own block; force a fresh header per call so
+		// parallel calls in one batch stay visually separate.
+		currentBlock = blockNone
 		beginStdout(blockTool, "[tool: "+label+"]")
 		argOneLine := strings.ReplaceAll(args, "\n", " ")
 		emitLine(nemo.TruncateUTF8(argOneLine, 128, " ..."))
+	}
+
+	onToolEnd := func(callID, name, args string, ok bool, detail string) {
+		label := name
+		if callID != "" {
+			label = callID + " " + name
+		}
+		// Re-open the header: a diff preview may have interrupted the block
+		// since the start callback, and the label re-anchors the result.
+		beginStdout(blockTool, "[tool: "+label+"]")
 		if ok {
 			emitLine("ok:")
 			emitLine(nemo.TruncateUTF8(detail, 128, " ..."))
@@ -388,7 +401,7 @@ func main() {
 		runDone := make(chan error, 1)
 		go func() {
 			runDone <- root.Run(turnCtx, s, instruction,
-				onReasoning, onContent, onSystem, onTool)
+				onReasoning, onContent, onSystem, onToolStart, onToolEnd)
 		}()
 
 		var err error
@@ -477,7 +490,7 @@ func main() {
 		runDone := make(chan error, 1)
 		go func() {
 			runDone <- root.Run(turnCtx, s, input,
-				onReasoning, onContent, onSystem, onTool)
+				onReasoning, onContent, onSystem, onToolStart, onToolEnd)
 		}()
 
 		var err error

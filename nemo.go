@@ -594,7 +594,7 @@ func NewReadTool(imageURL ImageTransport) Tool {
 				return "", err
 			}
 			// Images ride along as multimodal attachments instead of numbered
-			// text; the summary line is all the console (and the onTool report)
+			// text; the summary line is all the console (and the onToolEnd report)
 			// ever sees of them. Sniffing happens before the binary check below
 			// because image formats trip it (PNG, GIF, BMP, WebP carry NUL
 			// bytes; a NUL-free JPEG would still sniff here first). The URL
@@ -1657,10 +1657,7 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 		return "", "invalid tool call: expected an object with id and function", nil
 	}
 
-	callID, _ = call["id"].(string)
-	if callID == "" {
-		callID = fmt.Sprintf("call_%d", i)
-	}
+	callID = toolCallID(call, i)
 
 	fn, ok := call["function"].(map[string]any)
 	if !ok {
@@ -1691,7 +1688,7 @@ func handleToolCall(ctx context.Context, registry map[string]Tool, i int, tci an
 // Parallel tool-call execution.
 
 // toolCallResult carries the outcome of one call in a tool-call batch:
-// the pieces needed to report it (onTool) and append its tool message in
+// the pieces needed to report it (onToolEnd) and append its tool message in
 // call order, plus any display output (diff previews) the handler
 // emitted, buffered for ordered replay.
 type toolCallResult struct {
@@ -1702,6 +1699,19 @@ type toolCallResult struct {
 	callErr  error  // non-nil when the handler itself failed
 	displays []string
 	images   []string // image URLs attached by the handler, sent back as content parts
+}
+
+// toolCallID returns the id carried by a tool_calls entry, synthesizing
+// call_<i> when missing (malformed entries included) — the same ID
+// handleToolCall reports, so the start and end callbacks for one call can
+// be correlated.
+func toolCallID(tci any, i int) string {
+	if call, ok := tci.(map[string]any); ok {
+		if id, _ := call["id"].(string); id != "" {
+			return id
+		}
+	}
+	return fmt.Sprintf("call_%d", i)
 }
 
 // toolCallMeta extracts the function name and raw arguments string from
@@ -1794,7 +1804,10 @@ func toolMessage(callID, text string, imageURLs []string) map[string]any {
 }
 
 // processToolCalls executes the tool calls the model issued in one
-// assistant message and reports them. Non-mutating calls run
+// assistant message and reports them. onToolStart fires as each call is
+// dispatched — in issue order, from one goroutine, so callbacks need no
+// locking — while onToolEnd fires with the result once the batch has
+// finished, also in call order. Non-mutating calls run
 // concurrently, bounded by maxConcurrentToolCalls; mutating calls
 // (write/edit/delete) execute inline, one at a time in issue order, so
 // read-modify-write tools never race each other — two concurrent edits
@@ -1810,13 +1823,18 @@ func processToolCalls(
 	ctx context.Context,
 	registry map[string]Tool,
 	toolCalls []any,
-	onTool func(callID, name, args string, ok bool, detail string),
+	onToolStart func(callID, name, args string),
+	onToolEnd func(callID, name, args string, ok bool, detail string),
 	addMessage func(msg map[string]any),
 ) {
 	results := make([]toolCallResult, len(toolCalls))
 	sem := make(chan struct{}, maxConcurrentToolCalls)
 	var wg sync.WaitGroup
 	for i, tci := range toolCalls {
+		if onToolStart != nil {
+			name, argStr := toolCallMeta(tci)
+			onToolStart(toolCallID(tci, i), name, argStr)
+		}
 		if lookupTool(registry, tci).Mutating {
 			// Inline: at most one mutating call runs at any moment, in
 			// issue order, while any parallel reads continue alongside.
@@ -1840,8 +1858,8 @@ func processToolCalls(
 				display(d)
 			}
 		}
-		if onTool != nil {
-			onTool(r.callID, r.name, r.argStr, r.callErr == nil, r.out)
+		if onToolEnd != nil {
+			onToolEnd(r.callID, r.name, r.argStr, r.callErr == nil, r.out)
 		}
 		addMessage(toolMessage(r.callID, r.out, r.images))
 	}
@@ -1912,7 +1930,8 @@ func (ag *Agent) Run(
 	s *Session,
 	message string,
 	onReasoning, onContent, onSystem func(string),
-	onTool func(callID, name, args string, ok bool, detail string),
+	onToolStart func(callID, name, args string),
+	onToolEnd func(callID, name, args string, ok bool, detail string),
 ) error {
 
 	addMessage := func(msg map[string]any) {
@@ -1994,7 +2013,7 @@ func (ag *Agent) Run(
 		// Execute the model's tool calls: independent calls issued in one
 		// message run concurrently (mutating ones serialize among
 		// themselves); reporting and history stay in call order.
-		processToolCalls(ctx, registry, toolCalls, onTool, addMessage)
+		processToolCalls(ctx, registry, toolCalls, onToolStart, onToolEnd, addMessage)
 	}
 
 	return fmt.Errorf("max iterations reached")
