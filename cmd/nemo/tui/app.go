@@ -77,7 +77,8 @@ func (u *ui) loop() error {
 
 	u.p.Finalize([]string{
 		u.th.s(u.th.accent+u.th.bold, "nemo") + u.th.s(u.th.dim,
-			": turn-based coding assistant (Ctrl+C aborts a turn; exit or Ctrl+D to quit)"),
+			": turn-based coding assistant"),
+		u.th.s(u.th.dim, "Enter submit · Ctrl+J newline · Ctrl+C aborts turn · Ctrl+D exits"),
 		u.th.s(u.th.dim, fmt.Sprintf("nemo: model=%s base=%s", u.ag.Model, u.ag.Endpoint)),
 	})
 	u.repaint()

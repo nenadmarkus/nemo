@@ -149,3 +149,22 @@ func TestEditorWordMotion(t *testing.T) {
 		t.Fatalf("ctrl+left: cursor = %d, want 6", e.cur)
 	}
 }
+
+func TestEditorNewlineKeys(t *testing.T) {
+	e := NewEditor(nil)
+	e.Insert("a")
+	for _, k := range []Key{
+		{Name: KeyShiftEnter},       // Ctrl+J / bare LF decodes to this
+		{Name: KeyEnter, Alt: true}, // ESC CR (Alt+Enter)
+	} {
+		if e.Key(k) {
+			t.Fatalf("%+v must insert a newline, not submit", k)
+		}
+	}
+	if got := e.Text(); got != "a\n\n" {
+		t.Fatalf("text = %q, want %q", got, "a\n\n")
+	}
+	if !e.Key(Key{Name: KeyEnter}) {
+		t.Fatal("plain enter must submit")
+	}
+}

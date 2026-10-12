@@ -182,8 +182,12 @@ func (d *keyDecoder) flush(emit func(Key)) {
 // plainKey maps one ASCII byte to a key.
 func plainKey(c byte) (Key, bool) {
 	switch {
-	case c == '\r' || c == '\n':
+	case c == '\r':
 		return Key{Name: KeyEnter}, true
+	case c == '\n':
+		// A bare LF is Ctrl+J, the newline key (readline convention).
+		// Raw mode delivers Enter as CR, so LF never shadows submit.
+		return Key{Name: KeyShiftEnter}, true
 	case c == '\t':
 		return Key{Name: KeyTab}, true
 	case c == 0x7f:

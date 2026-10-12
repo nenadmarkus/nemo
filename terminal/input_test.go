@@ -12,6 +12,7 @@ func TestDecodeKeys(t *testing.T) {
 	}{
 		{"rune", []string{"a"}, []Key{{Name: KeyRune, R: 'a'}}},
 		{"enter", []string{"\r"}, []Key{{Name: KeyEnter}}},
+		{"lf is newline (ctrl+j)", []string{"\n"}, []Key{{Name: KeyShiftEnter}}},
 		{"backspace", []string{"\x7f"}, []Key{{Name: KeyBackspace}}},
 		{"ctrl-c", []string{"\x03"}, []Key{{Name: KeyRune, R: 'c', Ctrl: true}}},
 		{"arrow up", []string{"\x1b[A"}, []Key{{Name: KeyUp}}},
