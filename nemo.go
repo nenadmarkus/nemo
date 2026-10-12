@@ -76,9 +76,6 @@ const (
 	llmStreamTimeout = 5 * time.Minute
 	// fetchTimeout caps one tool fetch.
 	fetchTimeout = 15 * time.Second
-	// RunTimeout bounds an entire turn, so a wedged run cannot hang
-	// forever; the CLI applies it to each turn's context.
-	RunTimeout = 10 * time.Minute
 
 	// maxLLMResponseBytes caps one LLM response body.
 	maxLLMResponseBytes int64 = 1 << 20

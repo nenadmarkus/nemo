@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/deepteams/webp"
 	_ "golang.org/x/image/bmp"
@@ -409,7 +410,8 @@ func main() {
 		}
 
 		baseCtx := nemo.WithDisplay(context.Background(), onDiff)
-		turnCtx, cancel := context.WithTimeout(baseCtx, nemo.RunTimeout)
+		// A task turn is unbounded: only a signal (or process exit) can end it.
+		turnCtx, cancel := context.WithCancel(baseCtx)
 		before := len(s.Messages)
 		uBefore := s.Usage
 
@@ -493,12 +495,12 @@ func main() {
 		}
 		idleInterrupts = 0
 
-		// The turn runs on its own context: RunTimeout bounds it, and the
-		// select below can cancel it on a signal without touching the
-		// session or the process. The display emitter rides in the ctx so
+		// The turn runs on its own context: a 60-minute turn timeout bounds
+		// it, and the select below can cancel it on a signal without touching
+		// the session or the process. The display emitter rides in the ctx so
 		// write/edit can print diffs without a special result channel.
 		baseCtx := nemo.WithDisplay(context.Background(), onDiff)
-		turnCtx, cancel := context.WithTimeout(baseCtx, nemo.RunTimeout)
+		turnCtx, cancel := context.WithTimeout(baseCtx, 60*time.Minute)
 		before := len(s.Messages)
 		uBefore := s.Usage
 

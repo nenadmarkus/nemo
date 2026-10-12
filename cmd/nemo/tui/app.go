@@ -184,10 +184,10 @@ func (u *ui) interrupt() {
 }
 
 // startTurn echoes the user input, finalizing any open state, and runs
-// one exchange on its own context: RunTimeout bounds it and Ctrl-C can
-// cancel it without touching the session or the process. The display
-// emitter rides in the context so write/edit print diffs without a
-// special result channel.
+// one exchange on its own context: a 60-minute turn timeout bounds it
+// and Ctrl-C can cancel it without touching the session or the process.
+// The display emitter rides in the context so write/edit print diffs
+// without a special result channel.
 func (u *ui) startTurn(input string) {
 	u.finalizeBlock(newBlock(bUser, input))
 	u.running = true
@@ -198,7 +198,7 @@ func (u *ui) startTurn(input string) {
 	baseCtx := nemo.WithDisplay(context.Background(), func(d string) {
 		u.push(func() { u.onDiff(d) })
 	})
-	turnCtx, cancel := context.WithTimeout(baseCtx, nemo.RunTimeout)
+	turnCtx, cancel := context.WithTimeout(baseCtx, 60*time.Minute)
 	u.cancel = cancel
 	onR, onC, onS, onTS, onTE := u.bridge()
 	go func() {
