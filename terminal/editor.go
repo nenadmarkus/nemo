@@ -142,13 +142,13 @@ func (e *Editor) Key(k Key) bool {
 			e.buf = append(e.buf[:e.cur], e.buf[e.cur+1:]...)
 		}
 	case KeyLeft:
-		if k.Ctrl {
+		if k.Ctrl || k.Alt { // Ctrl/Option+←: word motion
 			e.wordBack()
 		} else if e.cur > 0 {
 			e.cur--
 		}
 	case KeyRight:
-		if k.Ctrl {
+		if k.Ctrl || k.Alt {
 			e.wordFwd()
 		} else if e.cur < len(e.buf) {
 			e.cur++
@@ -190,6 +190,12 @@ func (e *Editor) Key(k Key) bool {
 					e.buf = append(e.buf[:e.cur], e.buf[e.cur+1:]...)
 				}
 			}
+		} else if k.Alt && k.R == 'b' {
+			// ESC b / ESC f: how some terminals encode Option+←/→
+			// (iTerm2 default bindings, readline meta-b/f).
+			e.wordBack()
+		} else if k.Alt && k.R == 'f' {
+			e.wordFwd()
 		} else {
 			e.insertRune(k.R)
 		}

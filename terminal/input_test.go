@@ -18,6 +18,8 @@ func TestDecodeKeys(t *testing.T) {
 		{"arrow split across reads", []string{"\x1b", "[A"}, []Key{{Name: KeyUp}}},
 		{"ss3 right", []string{"\x1bOC"}, []Key{{Name: KeyRight}}},
 		{"ctrl right", []string{"\x1b[1;5C"}, []Key{{Name: KeyRight, Ctrl: true}}},
+		{"alt right", []string{"\x1b[1;3C"}, []Key{{Name: KeyRight, Alt: true}}},
+		{"alt left", []string{"\x1b[1;3D"}, []Key{{Name: KeyLeft, Alt: true}}},
 		{"home", []string{"\x1b[H"}, []Key{{Name: KeyHome}}},
 		{"delete", []string{"\x1b[3~"}, []Key{{Name: KeyDelete}}},
 		{"paste markers", []string{"\x1b[200~x\x1b[201~"}, []Key{

@@ -121,3 +121,31 @@ func TestEditorWrapWidth(t *testing.T) {
 		}
 	}
 }
+
+func TestEditorWordMotion(t *testing.T) {
+	e := NewEditor(nil)
+	e.Insert("hello world")
+	e.Key(Key{Name: KeyLeft, Alt: true}) // Option+← over "world"
+	if e.cur != 6 {
+		t.Fatalf("alt+left: cursor = %d, want 6", e.cur)
+	}
+	e.Key(Key{Name: KeyRune, R: 'b', Alt: true}) // ESC-b form of Option+←
+	if e.cur != 0 {
+		t.Fatalf("alt+b: cursor = %d, want 0", e.cur)
+	}
+	e.Key(Key{Name: KeyRight, Alt: true}) // Option+→ over "hello"
+	if e.cur != 5 {
+		t.Fatalf("alt+right: cursor = %d, want 5", e.cur)
+	}
+	e.Key(Key{Name: KeyRune, R: 'f', Alt: true}) // ESC-f form of Option+→
+	if e.cur != 11 {
+		t.Fatalf("alt+f: cursor = %d, want 11", e.cur)
+	}
+	if got := e.Text(); got != "hello world" {
+		t.Fatalf("motion must not edit the text, got %q", got)
+	}
+	e.Key(Key{Name: KeyLeft, Ctrl: true}) // ctrl+← keeps word-jumping too
+	if e.cur != 6 {
+		t.Fatalf("ctrl+left: cursor = %d, want 6", e.cur)
+	}
+}
