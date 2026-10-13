@@ -656,6 +656,114 @@ func TestProcessToolCallsImageAttachment(t *testing.T) {
 	}
 }
 
+func TestReadSSEStreamToolCallType(t *testing.T) {
+	// Assembled tool_calls entries must carry type "function" even when
+	// the streamed fragments omit it. Permissive backends (OpenAI,
+	// DeepSeek) stream tool-call deltas without a type and accept the
+	// echo-back without one; strict ones (Zhipu GLM) reject the next
+	// request with 400 code 1214 "Tool type cannot be empty" unless every
+	// echoed entry has a type. A missing type defaults to "function"; an
+	// explicit one is preserved.
+	stream := strings.Join([]string{
+		// Call 0: fragments with no type at all (OpenAI/DeepSeek style).
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"read","arguments":"{\"path\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}`,
+		// Call 1: explicit type, split across fragments.
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"grep","arguments":"{}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"\n",
+	}, "\n")
+
+	res, err := readSSEStream(strings.NewReader(stream), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("readSSEStream: %v", err)
+	}
+	calls, ok := res.assistant["tool_calls"].([]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("tool_calls = %#v, want 2 entries", res.assistant["tool_calls"])
+	}
+	for i, want := range []string{"function", "function"} {
+		call, _ := calls[i].(map[string]any)
+		if call["type"] != want {
+			t.Errorf("call %d type = %#v, want %q", i, call["type"], want)
+		}
+		if _, err := json.Marshal(call); err != nil {
+			t.Errorf("call %d marshal: %v", i, err)
+		}
+	}
+	// Arguments still accumulate across fragments.
+	fn, _ := calls[0].(map[string]any)["function"].(map[string]any)
+	if fn["arguments"] != `{"path":"x"}` {
+		t.Errorf("call 0 arguments = %#v, want concatenated JSON args", fn["arguments"])
+	}
+	if res.finishReason != "tool_calls" {
+		t.Errorf("finish_reason = %q, want tool_calls", res.finishReason)
+	}
+}
+
+func TestNormalizeToolCallTypes(t *testing.T) {
+	// Sessions written before the stream fix (or by other frontends) can
+	// hold assistant tool_calls entries without a type; buildRequestBody
+	// patches them to "function" at request time — copy-on-write, never
+	// mutating the session it was handed.
+	typed := map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{map[string]any{
+			"id": "c1", "type": "custom_kind",
+			"function": map[string]any{"name": "grep", "arguments": "{}"},
+		}},
+	}
+	typeless := map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{
+			map[string]any{
+				"id":       "c0",
+				"function": map[string]any{"name": "read", "arguments": "{}"},
+			},
+			typed["tool_calls"].([]any)[0], // shared entry, already typed
+		},
+	}
+	user := map[string]any{"role": "user", "content": "hi"}
+	session := []map[string]any{typeless, typed, user}
+
+	out := normalizeToolCallTypes(session)
+
+	// The caller's session must be untouched.
+	calls, _ := session[0]["tool_calls"].([]any)
+	if _, has := calls[0].(map[string]any)["type"]; has {
+		t.Error("normalizeToolCallTypes mutated the input session")
+	}
+	if !reflect.DeepEqual(session, []map[string]any{typeless, typed, user}) {
+		t.Error("normalizeToolCallTypes replaced input messages")
+	}
+
+	// Patched output: typeless becomes function, explicit type survives.
+	patched, _ := out[0]["tool_calls"].([]any)
+	if patched[0].(map[string]any)["type"] != "function" {
+		t.Errorf("patched type = %#v, want function", patched[0].(map[string]any)["type"])
+	}
+	if patched[1].(map[string]any)["type"] != "custom_kind" {
+		t.Errorf("explicit type clobbered: %#v", patched[1].(map[string]any)["type"])
+	}
+	kept, _ := out[1]["tool_calls"].([]any)
+	if kept[0].(map[string]any)["type"] != "custom_kind" {
+		t.Errorf("already-typed message was rewritten: %#v", out[1])
+	}
+	// The shared typed entry is the same object in input and output (no
+	// needless cloning), while the patched slice is new. Interface ==
+	// panics on map dynamic types, so compare by runtime pointer.
+	if reflect.ValueOf(patched[1]).Pointer() != reflect.ValueOf(typed["tool_calls"].([]any)[0]).Pointer() {
+		t.Error("typed entry was cloned unnecessarily")
+	}
+
+	// All-typed histories come back unchanged (same slice).
+	clean := []map[string]any{typed, user}
+	if got := normalizeToolCallTypes(clean); !reflect.DeepEqual(got, clean) {
+		t.Errorf("clean history rewritten: %#v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tool handlers (against temp directories).
 // ---------------------------------------------------------------------------

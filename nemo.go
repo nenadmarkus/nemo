@@ -1390,6 +1390,17 @@ func readSSEStream(r io.Reader, onReasoning, onContent, onSystem func(string)) (
 		if id, ok := tcm["id"].(string); ok && id != "" {
 			call["id"] = id
 		}
+		// Preserve the tool-call type when the upstream sends one, and
+		// default it to "function" otherwise. Strict OpenAI-compatible
+		// backends (e.g. Zhipu GLM, error 1214 "Tool type cannot be
+		// empty") reject an assistant message whose echoed tool_calls
+		// entries lack a type; permissive ones (OpenAI, DeepSeek) accept
+		// its omission, which is why this only surfaced on GLM.
+		if t, ok := tcm["type"].(string); ok && t != "" {
+			call["type"] = t
+		} else if _, ok := call["type"]; !ok {
+			call["type"] = "function"
+		}
 		if fn, ok := tcm["function"].(map[string]any); ok {
 			fnObj, _ := call["function"].(map[string]any)
 			if fnObj == nil {
@@ -1891,6 +1902,58 @@ type Agent struct {
 	SystemPrompt      string
 }
 
+// normalizeToolCallTypes returns messages with every assistant tool_calls
+// entry carrying an explicit type, defaulting to "function". Entries can
+// lack one when they were assembled by older versions or by other
+// frontends; strict backends (Zhipu GLM, error 1214 "Tool type cannot be
+// empty") reject the whole request over it. Copy-on-write: untouched
+// messages stay shared and the caller's session is never mutated.
+func normalizeToolCallTypes(messages []map[string]any) []map[string]any {
+	out := messages
+	cloned := false
+	for i, m := range messages {
+		calls, ok := m["tool_calls"].([]any)
+		if !ok || len(calls) == 0 {
+			continue
+		}
+		var newCalls []any
+		changed := false
+		for _, tc := range calls {
+			call, ok := tc.(map[string]any)
+			if !ok {
+				newCalls = append(newCalls, tc)
+				continue
+			}
+			if t, _ := call["type"].(string); t != "" {
+				newCalls = append(newCalls, tc)
+				continue
+			}
+			clone := make(map[string]any, len(call)+1)
+			for k, v := range call {
+				clone[k] = v
+			}
+			clone["type"] = "function"
+			newCalls = append(newCalls, clone)
+			changed = true
+		}
+		if !changed {
+			continue // nothing needed patching; message stays shared
+		}
+		if !cloned {
+			out = make([]map[string]any, len(messages))
+			copy(out, messages)
+			cloned = true
+		}
+		msgClone := make(map[string]any, len(m))
+		for k, v := range m {
+			msgClone[k] = v
+		}
+		msgClone["tool_calls"] = newCalls
+		out[i] = msgClone
+	}
+	return out
+}
+
 // buildRequestBody assembles the chat-completions request payload from the
 // agent's static configuration: model, history, and tool specs are always
 // present, while optional knobs (provider routing hints, temperature,
@@ -1898,7 +1961,7 @@ type Agent struct {
 func buildRequestBody(ag *Agent, messages []map[string]any, specs []map[string]any) map[string]any {
 	reqBody := map[string]any{
 		"model":       ag.Model,
-		"messages":    messages,
+		"messages":    normalizeToolCallTypes(messages),
 		"tools":       specs,
 		"tool_choice": "auto",
 	}
