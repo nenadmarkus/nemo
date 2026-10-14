@@ -1898,7 +1898,7 @@ type Agent struct {
 	Provider          map[string]any // nil = omit from the request
 	Temperature       *float64       // nil = omit from the request
 	MaxTokens         int            // 0 = omit from the request
-	MaxToolIterations int            // 0 = default
+	MaxToolIterations int            // 0 = unbounded; >0 caps iterations per turn
 	SystemPrompt      string
 }
 
@@ -2014,17 +2014,16 @@ func (ag *Agent) Run(
 	}
 	specs := buildToolSpecs(ag.Tools)
 
+	// maxIter <= 0 (the default) means unbounded: the loop runs until the
+	// model replies without tool calls, the context is cancelled, or the
+	// LLM call fails. A positive value still caps iterations per turn.
 	maxIter := ag.MaxToolIterations
-	if maxIter <= 0 {
-		const defaultMaxToolIterations = 32
-		maxIter = defaultMaxToolIterations
-	}
 	// Empty replies (neither content nor tool calls) are retried once with
 	// a nudge instead of failing the turn; the turn's earlier, valid tool
 	// exchanges are kept.
 	nudges := 0
 	const maxNudges = 1
-	for range maxIter {
+	for iter := 0; maxIter <= 0 || iter < maxIter; iter++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -2076,5 +2075,5 @@ func (ag *Agent) Run(
 		processToolCalls(ctx, registry, toolCalls, onToolStart, onToolEnd, addMessage)
 	}
 
-	return fmt.Errorf("max iterations reached")
+	return fmt.Errorf("max iterations reached (%d)", maxIter)
 }
