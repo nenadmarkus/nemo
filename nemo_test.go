@@ -1541,20 +1541,6 @@ func reqToolNames(t *testing.T, req map[string]any) []string {
 	return names
 }
 
-// asSubagentError asserts err is a *SubagentError with the given stage
-// and returns it.
-func asSubagentError(t *testing.T, err error, stage string) *SubagentError {
-	t.Helper()
-	var se *SubagentError
-	if !errors.As(err, &se) {
-		t.Fatalf("error %v (%T) is not a *SubagentError", err, err)
-	}
-	if se.Stage != stage {
-		t.Errorf("stage = %q, want %q", se.Stage, stage)
-	}
-	return se
-}
-
 // newNoteTool returns a tool that records each invocation's text; the
 // subagent gets it in its registry, so tests can observe it actually
 // using its tools inside its own exchange.
@@ -1667,9 +1653,8 @@ func TestSubagentRecursiveRegistryCall(t *testing.T) {
 
 	ctx := context.WithValue(context.Background(), subagentContextKey{}, true)
 	_, err := tool.Handler(ctx, map[string]any{"task": "nested"})
-	se := asSubagentError(t, err, "init")
-	if !strings.Contains(se.Err.Error(), "recursive") {
-		t.Errorf("init error = %v, want recursive-delegation message", se.Err)
+	if err == nil || !strings.Contains(err.Error(), "subagent init: recursive") {
+		t.Errorf("err = %v, want subagent init: recursive...", err)
 	}
 	if srv.reqCount() != 0 {
 		t.Errorf("recursion refusal must not reach the endpoint; got %d requests", srv.reqCount())
@@ -1906,7 +1891,9 @@ func TestSubagentTimeout(t *testing.T) {
 	if elapsed > time.Second {
 		t.Errorf("handler took %v; cancellation should propagate promptly", elapsed)
 	}
-	asSubagentError(t, err, "timeout")
+	if err == nil || !strings.Contains(err.Error(), "subagent timeout:") {
+		t.Errorf("err = %v, want subagent timeout: ...", err)
+	}
 }
 
 func TestSubagentMaxIterations(t *testing.T) {
@@ -1927,9 +1914,8 @@ func TestSubagentMaxIterations(t *testing.T) {
 	if err == nil {
 		t.Fatal("runaway subagent should hit its configured cap")
 	}
-	se := asSubagentError(t, err, "run")
-	if !errors.Is(se.Err, ErrMaxIterations) {
-		t.Errorf("run error = %v, want ErrMaxIterations (errors.Is)", se.Err)
+	if !errors.Is(err, ErrMaxIterations) {
+		t.Errorf("run error = %v, want ErrMaxIterations (errors.Is through the wrapping)", err)
 	}
 	if got := srv.reqCount(); got != 3 {
 		t.Errorf("child made %d requests, want 3 (configured leash)", got)
@@ -1947,20 +1933,20 @@ func TestSubagentInitFailures(t *testing.T) {
 
 	// Nil agent (miswired constructor).
 	_, err := NewSubagentTool(nil).Handler(ctx, args)
-	if se := asSubagentError(t, err, "init"); !strings.Contains(se.Err.Error(), "nil") {
-		t.Errorf("nil-agent failure = %v, want nil-agent message", se.Err)
+	if err == nil || !strings.Contains(err.Error(), "subagent init: agent is nil") {
+		t.Errorf("nil-agent failure = %v, want subagent init: agent is nil", err)
 	}
 
 	// Missing endpoint.
 	_, err = NewSubagentTool(&Agent{Model: "m"}).Handler(ctx, args)
-	if se := asSubagentError(t, err, "init"); !strings.Contains(se.Err.Error(), "endpoint") {
-		t.Errorf("endpoint failure = %v, want endpoint message", se.Err)
+	if err == nil || !strings.Contains(err.Error(), "subagent init: no endpoint") {
+		t.Errorf("endpoint failure = %v, want subagent init: no endpoint...", err)
 	}
 
 	// Missing model.
 	_, err = NewSubagentTool(&Agent{Endpoint: srv.endpoint()}).Handler(ctx, args)
-	if se := asSubagentError(t, err, "init"); !strings.Contains(se.Err.Error(), "model") {
-		t.Errorf("model failure = %v, want model message", se.Err)
+	if err == nil || !strings.Contains(err.Error(), "subagent init: no model") {
+		t.Errorf("model failure = %v, want subagent init: no model...", err)
 	}
 
 	if srv.reqCount() != 0 {
@@ -1976,9 +1962,8 @@ func TestSubagentUpstreamFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("upstream failure should fail the delegation")
 	}
-	se := asSubagentError(t, err, "run")
-	if !strings.Contains(se.Err.Error(), "scripted failure") {
-		t.Errorf("run error = %v, want the upstream message carried through", se.Err)
+	if err == nil || !strings.Contains(err.Error(), "scripted failure") {
+		t.Errorf("run error = %v, want the upstream message carried through", err)
 	}
 }
 
@@ -1993,9 +1978,8 @@ func TestSubagentEmptyFinalAnswer(t *testing.T) {
 	if err == nil || out != "" {
 		t.Fatalf("whitespace answer = (%q, %v), want an error", out, err)
 	}
-	se := asSubagentError(t, err, "run")
-	if !strings.Contains(se.Err.Error(), "empty final answer") {
-		t.Errorf("run error = %v, want empty-final-answer message", se.Err)
+	if err == nil || !strings.Contains(err.Error(), "empty final answer") {
+		t.Errorf("run error = %v, want empty-final-answer message", err)
 	}
 }
 

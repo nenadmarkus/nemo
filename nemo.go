@@ -2096,7 +2096,10 @@ func (ag *Agent) Run(
 // embedders build their own. The delegating (parent) agent gets the
 // subagent's final answer back as the tool result, and nothing of the
 // subagent's conversation leaks into the parent's session or vice versa:
-// each delegation runs on a fresh Session.
+// each delegation runs on a fresh Session. Failures are plain errors
+// naming the phase in the message ("subagent init: ...", "subagent
+// run: ...", "subagent timeout: ..."); run/timeout errors wrap the
+// underlying one so errors.Is still matches through them.
 
 // subagentContextKey marks the context a subagent runs under. The
 // subagent tool checks it before running a child, so a subagent trying
@@ -2111,23 +2114,6 @@ type subagentContextKey struct{}
 // the parent run's own deadline/cancellation, whichever comes first.
 const subagentTimeout = 10 * time.Minute
 
-// SubagentError is the structured failure the subagent tool returns when
-// a delegation could not produce an answer. It reports which phase
-// failed and the underlying cause, so the parent model can react (retry
-// with a narrower task, give up, or surface the problem) instead of
-// guessing at a bare error string. Failures surface as tool errors,
-// which Run routes back to the model as the call's tool message.
-type SubagentError struct {
-	Stage string // "init" | "run" | "timeout"
-	Err   error
-}
-
-func (e *SubagentError) Error() string {
-	return fmt.Sprintf("subagent %s: %v", e.Stage, e.Err)
-}
-
-func (e *SubagentError) Unwrap() error { return e.Err }
-
 // NewSubagentTool returns the delegation tool: it runs the task in sub,
 // the agent to run delegations in, and blocks until it finishes. sub is
 // used exactly as constructed — the tool sets nothing and mutates
@@ -2136,8 +2122,8 @@ func (e *SubagentError) Unwrap() error { return e.Err }
 // delegation cannot recurse), the system prompt, and the iteration
 // leash. Each delegation runs on a fresh session of its own. On success
 // the tool result is the subagent's final reply; failures come back as
-// *SubagentError (stage init/run/timeout plus the cause), and
-// cancelling the parent run cancels the child.
+// plain errors naming the phase, and cancelling the parent run cancels
+// the child.
 //
 // The tool is Mutating because a subagent typically carries write/edit/
 // delete/exec: delegations run inline with other mutating calls instead
@@ -2176,16 +2162,16 @@ func NewSubagentTool(sub *Agent) Tool {
 
 			// No recursive delegation.
 			if ctx.Value(subagentContextKey{}) != nil {
-				return "", &SubagentError{Stage: "init", Err: errors.New("recursive delegation is not supported")}
+				return "", errors.New("subagent init: recursive delegation is not supported")
 			}
 			if sub == nil {
-				return "", &SubagentError{Stage: "init", Err: errors.New("agent is nil")}
+				return "", errors.New("subagent init: agent is nil")
 			}
 			if sub.Endpoint == "" {
-				return "", &SubagentError{Stage: "init", Err: errors.New("subagent has no endpoint configured")}
+				return "", errors.New("subagent init: no endpoint configured")
 			}
 			if sub.Model == "" {
-				return "", &SubagentError{Stage: "init", Err: errors.New("subagent has no model configured")}
+				return "", errors.New("subagent init: no model configured")
 			}
 
 			// Run to completion on a fresh session: the delegation
@@ -2214,16 +2200,16 @@ func NewSubagentTool(sub *Agent) Tool {
 			session := NewSession()
 			if err := sub.Run(runCtx, session, b.String(), nil, nil, nil, nil, nil); err != nil {
 				if errors.Is(err, context.DeadlineExceeded) {
-					return "", &SubagentError{Stage: "timeout", Err: fmt.Errorf("parent run window closed: %w", err)}
+					return "", fmt.Errorf("subagent timeout: %w", err)
 				}
-				return "", &SubagentError{Stage: "run", Err: err}
+				return "", fmt.Errorf("subagent run: %w", err)
 			}
 
 			// The final reply: the last assistant message carrying
 			// content, not intermediate text streamed beside tool calls.
 			final := strings.TrimSpace(finalAssistantContent(session))
 			if final == "" {
-				return "", &SubagentError{Stage: "run", Err: errors.New("subagent returned an empty final answer")}
+				return "", errors.New("subagent run: empty final answer")
 			}
 			return final, nil
 		},
