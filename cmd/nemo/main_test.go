@@ -6,8 +6,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"nemo"
@@ -159,5 +164,69 @@ func TestGitFilterTools(t *testing.T) {
 		filepath.Join(tmp, "x.go") + ":1: package x"
 	if out != want {
 		t.Errorf("grep package = %q, want %q", out, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildAgent: subagent construction and shaping.
+// ---------------------------------------------------------------------------
+
+// TestBuildAgentSubagent pins the delegation wiring done here in the
+// command (the library's tool uses the agent as-is): the root agent
+// carries the delegation tool, the separately constructed subagent agent
+// does not (recursion impossible by construction), and the delegation
+// contract and leash are baked into it.
+func TestBuildAgentSubagent(t *testing.T) {
+	cfg := config{BaseURL: "https://example.test/v1", APIKey: "k", Model: "m"}
+	ag := buildAgent(cfg)
+
+	var subTool nemo.Tool
+	for _, tt := range ag.Tools {
+		if tt.Name == "subagent" {
+			subTool = tt
+		}
+	}
+	if subTool.Name == "" {
+		t.Fatal("root agent lacks the delegation tool")
+	}
+
+	// Run one delegation against a fake endpoint and inspect what the
+	// child sent: the addendum is in its prompt, not the root's.
+	var gotPrompt string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("bad request body: %v", err)
+			return
+		}
+		for _, m := range req["messages"].([]any) {
+			if msg, _ := m.(map[string]any); msg["role"] == "system" {
+				gotPrompt, _ = msg["content"].(string)
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n"+
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	cfg.BaseURL = srv.URL + "/chat/completions"
+	ag = buildAgent(cfg)
+	for _, tt := range ag.Tools {
+		if tt.Name == "subagent" {
+			subTool = tt
+		}
+	}
+	if _, err := subTool.Handler(context.Background(), map[string]any{"task": "t"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(gotPrompt, subagentAddendum) {
+		t.Errorf("subagent prompt lacks the delegation contract:\n%s", gotPrompt)
+	}
+	if ag.SystemPrompt == gotPrompt {
+		t.Error("root prompt and subagent prompt are identical; the subagent agent must be constructed separately")
+	}
+	if !strings.Contains(gotPrompt, ag.SystemPrompt) {
+		t.Error("subagent prompt dropped the resolved standing instructions")
 	}
 }

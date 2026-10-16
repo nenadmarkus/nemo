@@ -80,10 +80,29 @@ func loadConfig(value string) (config, error) {
 	return cfg, nil
 }
 
+// subagentAddendum is appended to the root agent's standing instructions
+// so the subagent knows the delegation contract: only the final reply
+// crosses back to the parent, so it has to carry the whole answer.
+const subagentAddendum = "You are executing a single delegated task as a subagent.\n" +
+	"Work the task directly with your tools; be minimal and brief.\n" +
+	"When the task is done, reply with your complete final answer: it is the only part the delegating agent will see."
+
+// subagentMaxIterations is the subagent's leash: the root agent runs
+// unbounded, but a delegation works unattended inside one blocked tool
+// call, so a stuck subagent gets cut off instead of stalling the turn
+// until the delegation timeout.
+const subagentMaxIterations = 25
+
 // buildAgent assembles the root agent from a resolved config; all model
-// and endpoint data enters the library through Agent fields.
+// and endpoint data enters the library through Agent fields. The
+// delegation tool is appended after construction: it runs delegations in
+// a separately constructed subagent agent — same model configuration and
+// workspace tools, the delegation contract appended to the standing
+// instructions, and a tight leash — used as-is by the tool. The
+// subagent's registry is simply DefaultTools without the delegation
+// tool itself, so delegation cannot recurse.
 func buildAgent(cfg config) *nemo.Agent {
-	return &nemo.Agent{
+	ag := &nemo.Agent{
 		Name:         "root",
 		Endpoint:     cfg.BaseURL,
 		APIKey:       cfg.APIKey,
@@ -94,6 +113,20 @@ func buildAgent(cfg config) *nemo.Agent {
 		MaxTokens:    cfg.MaxTokens,
 		SystemPrompt: nemo.ResolveSystemPrompt(cfg.SystemPrompt),
 	}
+	sub := &nemo.Agent{
+		Name:              "subagent",
+		Endpoint:          cfg.BaseURL,
+		APIKey:            cfg.APIKey,
+		Model:             cfg.Model,
+		Tools:             nemo.DefaultTools(webpImageURL, gitFilter),
+		Provider:          cfg.Provider,
+		Temperature:       cfg.Temperature,
+		MaxTokens:         cfg.MaxTokens,
+		MaxToolIterations: subagentMaxIterations,
+		SystemPrompt:      nemo.ResolveSystemPrompt(cfg.SystemPrompt) + "\n\n" + subagentAddendum,
+	}
+	ag.Tools = append(ag.Tools, nemo.NewSubagentTool(sub))
+	return ag
 }
 
 // ---------------------------------------------------------------------------

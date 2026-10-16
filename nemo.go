@@ -1902,6 +1902,11 @@ type Agent struct {
 	SystemPrompt      string
 }
 
+// ErrMaxIterations is wrapped into the error Run returns when the agent
+// hits its MaxToolIterations cap before the model produces a plain
+// reply; callers (such as the subagent tool) can match it with errors.Is.
+var ErrMaxIterations = errors.New("max iterations reached")
+
 // normalizeToolCallTypes returns messages with every assistant tool_calls
 // entry carrying an explicit type, defaulting to "function". Entries can
 // lack one when they were assembled by older versions or by other
@@ -2075,5 +2080,168 @@ func (ag *Agent) Run(
 		processToolCalls(ctx, registry, toolCalls, onToolStart, onToolEnd, addMessage)
 	}
 
-	return fmt.Errorf("max iterations reached (%d)", maxIter)
+	return fmt.Errorf("%w (%d)", ErrMaxIterations, maxIter)
+}
+
+// ---------------------------------------------------------------------------
+// Subagent tool: delegation to a configured agent.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+// The subagent tool is one synchronous Tool whose handler runs the task
+// in the agent it was constructed with — used as given, never modified —
+// and blocks until it finishes. Constructing and shaping the agent
+// (model, tools, system prompt, iteration leash) is the caller's job:
+// the nemo command builds it next to the root agent (see buildAgent);
+// embedders build their own. The delegating (parent) agent gets the
+// subagent's final answer back as the tool result, and nothing of the
+// subagent's conversation leaks into the parent's session or vice versa:
+// each delegation runs on a fresh Session.
+
+// subagentContextKey marks the context a subagent runs under. The
+// subagent tool checks it before running a child, so a subagent trying
+// to delegate again fails fast (before spending a model call) even if
+// the caller left the tool in its registry.
+type subagentContextKey struct{}
+
+// subagentTimeout bounds one delegation. Agent.Run has no deadline of
+// its own (it runs until the model stops calling tools, the context is
+// cancelled, or the LLM call fails); a subagent works unattended inside
+// a blocked tool call, so the tool applies this cap — itself bounded by
+// the parent run's own deadline/cancellation, whichever comes first.
+const subagentTimeout = 10 * time.Minute
+
+// SubagentError is the structured failure the subagent tool returns when
+// a delegation could not produce an answer. It reports which phase
+// failed and the underlying cause, so the parent model can react (retry
+// with a narrower task, give up, or surface the problem) instead of
+// guessing at a bare error string. Failures surface as tool errors,
+// which Run routes back to the model as the call's tool message.
+type SubagentError struct {
+	Stage string // "init" | "run" | "timeout"
+	Err   error
+}
+
+func (e *SubagentError) Error() string {
+	return fmt.Sprintf("subagent %s: %v", e.Stage, e.Err)
+}
+
+func (e *SubagentError) Unwrap() error { return e.Err }
+
+// NewSubagentTool returns the delegation tool: it runs the task in sub,
+// the agent to run delegations in, and blocks until it finishes. sub is
+// used exactly as constructed — the tool sets nothing and mutates
+// nothing — so the caller owns the whole configuration: the model and
+// endpoint, the tool registry (leave the delegation tool out of it and
+// delegation cannot recurse), the system prompt, and the iteration
+// leash. Each delegation runs on a fresh session of its own. On success
+// the tool result is the subagent's final reply; failures come back as
+// *SubagentError (stage init/run/timeout plus the cause), and
+// cancelling the parent run cancels the child.
+//
+// The tool is Mutating because a subagent typically carries write/edit/
+// delete/exec: delegations run inline with other mutating calls instead
+// of racing them. The subagent runs on a context derived from the parent
+// tool call's, so display output (diffs) and image attachments from the
+// child's tools are buffered and replayed into the parent's console and
+// tool result, like any other tool's.
+func NewSubagentTool(sub *Agent) Tool {
+	return Tool{
+		Name: "subagent",
+		Description: "delegate a task to an independent subagent that runs synchronously with its own model and tools " +
+			"and returns its final answer; " +
+			"use it for self-contained work such as research, exploration, or verification; " +
+			"the call blocks until the subagent finishes",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"task": map[string]any{
+					"type":        "string",
+					"description": "the task assigned to the subagent",
+				},
+				"context": map[string]any{
+					"type":        "string",
+					"description": "additional information needed to complete the task (findings so far, constraints, file paths)",
+				},
+			},
+			"required": []string{"task"},
+		},
+		Mutating: true,
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			task, ok := args["task"].(string)
+			if !ok || strings.TrimSpace(task) == "" {
+				return "", fmt.Errorf("task is required")
+			}
+			contextInfo, _ := args["context"].(string) // optional
+
+			// No recursive delegation.
+			if ctx.Value(subagentContextKey{}) != nil {
+				return "", &SubagentError{Stage: "init", Err: errors.New("recursive delegation is not supported")}
+			}
+			if sub == nil {
+				return "", &SubagentError{Stage: "init", Err: errors.New("agent is nil")}
+			}
+			if sub.Endpoint == "" {
+				return "", &SubagentError{Stage: "init", Err: errors.New("subagent has no endpoint configured")}
+			}
+			if sub.Model == "" {
+				return "", &SubagentError{Stage: "init", Err: errors.New("subagent has no model configured")}
+			}
+
+			// Run to completion on a fresh session: the delegation
+			// shares nothing with the parent's conversation.
+			// Cancellation propagates (ctx is the parent run's
+			// context); the timeout rides on top of it. The child
+			// context carries the marker even though a properly
+			// wired registry lacks this tool — defense in depth. All
+			// streaming callbacks are nil: nothing of the child's
+			// exchange is echoed to the parent's console, and the
+			// answer is read from the child session afterwards.
+			runCtx, cancel := context.WithTimeout(
+				context.WithValue(ctx, subagentContextKey{}, true),
+				subagentTimeout,
+			)
+			defer cancel()
+
+			var b strings.Builder
+			b.WriteString("Task: ")
+			b.WriteString(task)
+			if strings.TrimSpace(contextInfo) != "" {
+				b.WriteString("\n\nContext: ")
+				b.WriteString(contextInfo)
+			}
+
+			session := NewSession()
+			if err := sub.Run(runCtx, session, b.String(), nil, nil, nil, nil, nil); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return "", &SubagentError{Stage: "timeout", Err: fmt.Errorf("parent run window closed: %w", err)}
+				}
+				return "", &SubagentError{Stage: "run", Err: err}
+			}
+
+			// The final reply: the last assistant message carrying
+			// content, not intermediate text streamed beside tool calls.
+			final := strings.TrimSpace(finalAssistantContent(session))
+			if final == "" {
+				return "", &SubagentError{Stage: "run", Err: errors.New("subagent returned an empty final answer")}
+			}
+			return final, nil
+		},
+	}
+}
+
+// finalAssistantContent returns the text of the last assistant message
+// carrying content — the final reply of a finished run. Intermediate
+// assistant messages (text emitted alongside tool calls) are skipped, so
+// only the closing answer is surfaced.
+func finalAssistantContent(s *Session) string {
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i]["role"] != "assistant" {
+			continue
+		}
+		if c, ok := s.Messages[i]["content"].(string); ok && strings.TrimSpace(c) != "" {
+			return c
+		}
+	}
+	return ""
 }
