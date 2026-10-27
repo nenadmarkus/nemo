@@ -1,0 +1,5 @@
+.cache/
+.node/
+
+wasm/wasm_exec.js
+wasm/nemo.wasm

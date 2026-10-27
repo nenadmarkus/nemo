@@ -1,0 +1,217 @@
+<!doctype html>
+<!-- nemo in the browser: type a prompt, watch reasoning, content, tool
+     calls, and diffs stream in; tools registered here run in your page.
+     Serve this directory over HTTP (CORS: the LLM endpoint must allow
+     your origin), put an endpoint+model+api_key in the config box, and
+     chat. No server-side component: the wasm module fetches the LLM. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nemo — wasm</title>
+<style>
+	:root { color-scheme: dark; }
+	* { box-sizing: border-box; }
+	body {
+		margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		background: #0b0e14; color: #d5dae2; display: flex; flex-direction: column; height: 100vh;
+	}
+	header { display: flex; gap: 1em; align-items: center; padding: .5em 1em; background: #11151d; border-bottom: 1px solid #232a36; }
+	header h1 { font-size: 1em; margin: 0; color: #8ab4f8; }
+	#cfg { flex: 1; font: inherit; background: #0b0e14; color: inherit; border: 1px solid #232a36; border-radius: 6px; padding: .4em .6em; }
+	#cfg.err { border-color: #e5534b; }
+	#transcript { flex: 1; overflow-y: auto; padding: 1em; display: flex; flex-direction: column; gap: .75em; }
+	.msg { max-width: 72ch; white-space: pre-wrap; word-break: break-word; padding: .6em .8em; border-radius: 8px; background: #11151d; border: 1px solid #232a36; }
+	.msg.user { align-self: flex-end; background: #16223a; border-color: #274080; }
+	.msg.reasoning { color: #7d8590; font-style: italic; }
+	.msg.system { color: #d29922; }
+	.msg.tool { color: #8ab4f8; }
+	.msg.diff { color: #7ee787; font-size: .92em; }
+	.msg .meta { color: #7d8590; font-size: .85em; margin-bottom: .3em; }
+	form { display: flex; gap: .5em; padding: .75em; background: #11151d; border-top: 1px solid #232a36; }
+	#prompt { flex: 1; font: inherit; background: #0b0e14; color: inherit; border: 1px solid #232a36; border-radius: 6px; padding: .5em .7em; resize: none; }
+	button { font: inherit; background: #1f6feb; color: #fff; border: 0; border-radius: 6px; padding: .5em 1.1em; cursor: pointer; }
+	button:disabled { opacity: .45; cursor: default; }
+	button.secondary { background: #30363d; }
+	.status { color: #7d8590; font-size: .85em; }
+	.raw { white-space: pre-wrap; word-break: break-word; color: #b581d0; max-height: 40vh; overflow-y: auto; }
+</style>
+</head>
+<body>
+<header>
+	<h1>nemo·wasm</h1>
+	<input id="cfg" spellcheck="false" placeholder='config: {"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"…","api_key":"…"}'
+		aria-label="run config">
+	<span class="status" id="status">loading…</span>
+</header>
+<div id="transcript" aria-live="polite"></div>
+<form id="form">
+	<textarea id="prompt" rows="2" placeholder="ask anything… (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+	<button id="stop" class="secondary" type="button" hidden>stop</button>
+	<button id="send">send</button>
+</form>
+
+<script src="nemo.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const transcript = $("transcript");
+
+function add(kind, text, meta) {
+	const el = document.createElement("div");
+	el.className = "msg " + kind;
+	if (meta) {
+		const m = document.createElement("div");
+		m.className = "meta";
+		m.textContent = meta;
+		el.appendChild(m);
+	}
+	const body = document.createElement("div");
+	body.textContent = text;
+	el.appendChild(body);
+	transcript.appendChild(el);
+	transcript.scrollTop = transcript.scrollHeight;
+	return body;
+}
+
+// Page-provided tools: things only a browser can do.
+const browserTools = [
+	{
+		name: "clock",
+		description: "current date and time in the browser, ISO-8601",
+		parameters: { type: "object", properties: {} },
+		run: () => new Date().toISOString(),
+	},
+	{
+		name: "geo",
+		description: "the browser's approximate geolocation, if permitted",
+		parameters: { type: "object", properties: {} },
+		run: () => new Promise((resolve, reject) =>
+			navigator.geolocation.getCurrentPosition(
+				p => resolve({ result: JSON.stringify(p.coords) }),
+				e => reject(new Error(e.message)))),
+	},
+	{
+		name: "navigate",
+		description: "open a URL in a new tab (popup blockers may interfere)",
+		parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+		mutating: true,
+		run: (args) => { window.open(args.url, "_blank", "noopener"); return "opened " + args.url; },
+	},
+];
+
+let nemo = null, run = null;
+
+// loadConfig reads + validates the config box (persisted in localStorage).
+function loadConfig() {
+	const raw = $("cfg").value.trim();
+	$("cfg").classList.remove("err");
+	if (!raw) { $("cfg").classList.add("err"); $("cfg").focus(); return null; }
+	try {
+		const cfg = JSON.parse(raw);
+		localStorage.setItem("nemo.cfg", raw);
+		return cfg;
+	} catch (e) {
+		$("cfg").classList.add("err");
+		add("system", "config: invalid JSON — " + e.message);
+		return null;
+	}
+}
+
+async function startTurn(text) {
+	const cfg = loadConfig();
+	if (!cfg) return;
+	$("send").disabled = true;
+	$("stop").hidden = false;
+	if (!run) {
+		run = nemo.run(cfg, text);
+		wire(run);
+	} else {
+		run.send(text, cfg);
+	}
+}
+
+function wire(run) {
+	let reasoning = null, content = null;
+	run.onReasoning(ev => { reasoning = add("reasoning", ev.delta, "thinking"); content = null; });
+	run.onSystem(ev => {
+		if (/^upstream|^attempt \d/.test(ev.message)) add("system", cleanErr(ev.message));
+	});
+	run.onDisplay(ev => add("diff", ev.text, "diff preview"));
+	run.onToolStart(ev => add("tool", prettyCall(ev), ev.name + " — running"));
+	run.onToolEnd(ev => {
+		const el = add("tool", ev.ok ? (ev.result || "") : ("error: " + ev.error),
+			ev.name + (ev.ok ? " — ok" : " — failed"));
+		// summarize long results, keep the full text reachable
+		if (ev.ok && el.textContent.length > 2000) {
+			const full = el.textContent;
+			el.textContent = full.slice(0, 2000) + "…";
+			const more = document.createElement("a");
+			more.href = "#"; more.textContent = ` [show all ${full.length} bytes]`;
+			more.onclick = e => { e.preventDefault(); el.textContent = full; };
+			el.appendChild(more);
+		}
+	});
+	run.onContent(ev => {
+		if (!content || !content.parentNode) content = add("", "");
+		content.textContent += ev.delta;
+		transcript.scrollTop = transcript.scrollHeight;
+		reasoning = null;
+	});
+	run.done.then(ev => {
+		$("send").disabled = false;
+		$("stop").hidden = true;
+		const err = ev.error ? cleanErr(ev.error) : "";
+		if (ev.usage) add("system", (err || "done") + " — " + ev.usage);
+		else add("system", err || "done");
+	}).catch(() => { /* never rejects before done resolves */ });
+}
+
+// cleanErr turns an upstream error blob into a readable line: strips
+// HTML, collapses whitespace, truncates — and adds a targeted hint when
+// the endpoint is clearly not an LLM API (a static file server rejects
+// POST with 501, CORS failures mention the fetch API, etc.).
+function cleanErr(text) {
+	let t = String(text).replace(/<style[\s\S]*?<\/style>/gi, "");
+	t = t.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+	if (/Unsupported method \('POST'\)|501/i.test(t) && /http\.server|Error response/i.test(String(text))) {
+		t = `endpoint rejected POST (${t.match(/Error code: \d+/)?.[0] || "501"}) — ` +
+			"it looks like a static file server. Set endpoint to your LLM's chat-completions URL, " +
+			'e.g. {"endpoint":"https://openrouter.ai/api/v1/chat/completions",…}';
+	} else if (/Failed to fetch|NetworkError|CORS/i.test(t)) {
+		t += " — the endpoint must send CORS headers allowing this origin (OpenRouter does; api.openai.com does not).";
+	} else if (t.length > 300) {
+		t = t.slice(0, 300) + "…";
+	}
+	return t;
+}
+
+function prettyCall(ev) {
+	try { return JSON.stringify(ev.args, null, 1); } catch { return String(ev.args); }
+}
+
+$("form").addEventListener("submit", e => {
+	e.preventDefault();
+	const text = $("prompt").value.trim();
+	if (!text || $("send").disabled) return;
+	$("prompt").value = "";
+	add("user", text);
+	startTurn(text);
+});
+$("prompt").addEventListener("keydown", e => {
+	if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
+});
+$("stop").addEventListener("click", () => run && run.cancel());
+// config: the terminal client's schema works here too —
+// {"base_url":"https://openrouter.ai/api/v1","model":"…","api_key":"…"}
+// or {"endpoint":"https://openrouter.ai/api/v1/chat/completions",…}
+$("cfg").value = localStorage.getItem("nemo.cfg") || "";
+
+Nemo.load().then(api => {
+	nemo = api;
+	for (const t of browserTools) nemo.registerTool(t);
+	$("status").textContent = `${browserTools.length} tools ready`;
+}).catch(err => { $("status").textContent = "load failed"; add("system", "load failed: " + err.message); });
+</script>
+</body>
+</html>
