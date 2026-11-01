@@ -25,6 +25,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     file \
     poppler-utils \
+    curl \
+    wget \
+    git-lfs \
+    openssh-client \
+    procps \
+    psmisc \
+    lsof \
+    net-tools \
+    iputils-ping \
+    dnsutils \
+    rsync \
+    patch \
+    diffutils \
+    make \
+    gcc \
+    g++ \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home nemo
